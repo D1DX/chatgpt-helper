@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 320px;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #F5F7FA;
+      color: #4A4A4A;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 15px;
+      font-weight: 600;
+      color: #005490;
+      margin-bottom: 12px;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      color: #fff;
+      background: #FF6900;
+      padding: 2px 6px;
+      border-radius: 3px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      margin-bottom: 4px;
+      color: #4A4A4A;
+    }
+    .field { margin-bottom: 10px; }
+    select, input {
+      width: 100%;
+      padding: 6px 8px;
+      font-size: 12px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      background: #fff;
+      font-family: inherit;
+    }
+    .row { display: flex; gap: 8px; }
+    .row .field { flex: 1; }
+    .checkbox-field {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .checkbox-field input { width: auto; }
+    .checkbox-field label { margin: 0; }
+    button {
+      width: 100%;
+      padding: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #fff;
+      background: #005490;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-top: 4px;
+    }
+    button:hover { background: #003d6b; }
+    button:disabled { background: #999; cursor: not-allowed; }
+    #progress {
+      margin-top: 10px;
+      font-size: 11px;
+      color: #666;
+      min-height: 14px;
+    }
+    #progress-bar-container {
+      display: none;
+      margin-top: 6px;
+      background: #e0e0e0;
+      border-radius: 3px;
+      overflow: hidden;
+      height: 6px;
+    }
+    #progress-bar {
+      height: 100%;
+      background: #0FB5A9;
+      width: 0%;
+      transition: width 0.3s;
+    }
+    .error { color: #c0392b; }
+    .footer {
+      margin-top: 12px;
+      padding-top: 8px;
+      border-top: 1px solid #e0e0e0;
+      font-size: 10px;
+      color: #999;
+      text-align: center;
+    }
+    .footer a { color: #005490; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <h1>ChatGPT Export <span class="badge">D1DX</span></h1>
+
+  <div class="field">
+    <label>Source</label>
+    <select id="source">
+      <option value="active">Active conversations</option>
+      <option value="archived">Archived conversations</option>
+      <option value="both" selected>Both (active + archived)</option>
+    </select>
+  </div>
+
+  <div class="row">
+    <div class="field">
+      <label>From</label>
+      <input type="date" id="date-from">
+    </div>
+    <div class="field">
+      <label>To</label>
+      <input type="date" id="date-to">
+    </div>
+  </div>
+
+  <div class="field">
+    <label>Keyword filter</label>
+    <input type="text" id="keyword" placeholder="Filter by title (optional)">
+  </div>
+
+  <div class="field">
+    <label>Max conversations (0 = all)</label>
+    <input type="number" id="limit" value="0" min="0">
+  </div>
+
+  <div class="checkbox-field">
+    <input type="checkbox" id="attachments">
+    <label for="attachments">Include attachments &amp; images</label>
+  </div>
+
+  <button id="export-btn">Export</button>
+
+  <div id="progress"></div>
+  <div id="progress-bar-container"><div id="progress-bar"></div></div>
+
+  <div class="footer">
+    Open source by <a href="https://github.com/d1dx" target="_blank">D1DX</a>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
