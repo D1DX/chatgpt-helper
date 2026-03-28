@@ -3,7 +3,7 @@
   "name": "ChatGPT Helper",
   "version": "2.0.0",
   "description": "Export, archive, and unarchive ChatGPT conversations — with filters, multiple formats, and attachments.",
-  "permissions": ["activeTab", "scripting"],
+  "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": ["https://chatgpt.com/*"],
   "action": {
     "default_popup": "popup.html",

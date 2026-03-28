@@ -181,3 +181,32 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 // Init
 updateUI();
+
+// Restore state from storage (survives popup close/reopen)
+chrome.storage.local.get('helperState', (data) => {
+  const s = data.helperState;
+  if (!s) return;
+
+  // Restore logs
+  if (s.logs) {
+    $('log-container').style.display = 'block';
+    $('log').textContent = s.logs;
+    $('log-container').scrollTop = $('log-container').scrollHeight;
+  }
+
+  // Restore progress
+  if (s.progress) {
+    $('progress').textContent = s.progress;
+    if (s.status === 'error') $('progress').className = 'error';
+  }
+  if (s.percent !== undefined) {
+    $('progress-bar-container').style.display = 'block';
+    $('progress-bar').style.width = s.percent + '%';
+  }
+
+  // Disable buttons if still running
+  if (s.running) {
+    ['export-btn', 'archive-btn', 'unarchive-btn'].forEach((id) => { $(id).disabled = true; });
+    $('export-btn').textContent = 'Running…';
+  }
+});
