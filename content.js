@@ -67,16 +67,15 @@ if (!window.__chatgptExportLoaded) {
     return data;
   }
 
-  async function listConversations(archived, auth, maxItems = 0, gizmoId = null) {
-    D('listConversations: archived =', archived, ', maxItems =', maxItems, ', gizmoId =', gizmoId);
+  async function listConversations(archived, auth, maxItems = 0) {
+    D('listConversations: archived =', archived, ', maxItems =', maxItems);
     let offset = 0;
     let total = null;
     const items = [];
     const pageSize = maxItems > 0 ? Math.min(LIMIT, maxItems) : LIMIT;
     D('listConversations: pageSize =', pageSize);
     while (total === null || offset < total) {
-      let url = `/conversations?offset=${offset}&limit=${pageSize}&order=updated&is_archived=${archived}&is_starred=false`;
-      if (gizmoId) url += `&gizmo_id=${gizmoId}`;
+      const url = `/conversations?offset=${offset}&limit=${pageSize}&order=updated&is_archived=${archived}&is_starred=false`;
       D('listConversations: fetching url =', url);
       const data = await api(url, auth);
       total = data.total;
@@ -239,37 +238,44 @@ if (!window.__chatgptExportLoaded) {
       const auth = await getAuth();
       D('runExport: auth OK, accountId =', auth.accountId);
 
-      // Server-side gizmo filter (project conversations are separate in the API)
-      const gizmoId = (options.project && options.project !== 'all' && options.project !== 'inbox')
-        ? options.project : null;
-      D('runExport: gizmoId =', gizmoId);
-
-      // Early limit only when no client-side filters will reduce the set
-      const hasClientFilters = options.keyword || options.dateFrom || options.dateTo
-        || options.project === 'inbox';
-      const earlyLimit = (!hasClientFilters && options.limit > 0) ? options.limit : 0;
-      D('runExport: hasClientFilters =', hasClientFilters, ', earlyLimit =', earlyLimit);
+      const isProjectFilter = options.project && options.project !== 'all' && options.project !== 'inbox';
+      D('runExport: isProjectFilter =', isProjectFilter, ', project =', options.project);
 
       let all = [];
-      if (options.source === 'active' || options.source === 'both') {
-        D('runExport: listing ACTIVE conversations, earlyLimit =', earlyLimit, ', gizmoId =', gizmoId);
-        progress('Listing active conversations…', 5);
-        const active = await listConversations(false, auth, earlyLimit, gizmoId);
-        D('runExport: active result count =', active.length);
-        all.push(...active.map((c) => ({ ...c, _source: 'active' })));
-      }
-      if (options.source === 'archived' || options.source === 'both') {
-        if (earlyLimit > 0 && all.length >= earlyLimit) {
-          D('runExport: skipping archived — earlyLimit already satisfied');
-        } else {
-          D('runExport: listing ARCHIVED conversations');
-          progress('Listing archived conversations…', 10);
-          await sleep(DELAY_MS);
-          const remaining = earlyLimit > 0 ? earlyLimit - all.length : 0;
-          D('runExport: remaining =', remaining, ', gizmoId =', gizmoId);
-          const archived = await listConversations(true, auth, remaining, gizmoId);
-          D('runExport: archived result count =', archived.length);
-          all.push(...archived.map((c) => ({ ...c, _source: 'archived' })));
+
+      if (isProjectFilter) {
+        // Project conversations must be fetched through gizmo-specific endpoint
+        D('runExport: fetching project conversations for', options.project);
+        progress('Listing project conversations…', 5);
+        const projectConvs = await listProjectConversations(options.project, auth);
+        all.push(...projectConvs.map((c) => ({ ...c, _source: 'active' })));
+        D('runExport: project conversations count =', all.length);
+      } else {
+        // Regular conversations (inbox or all)
+        const hasClientFilters = options.keyword || options.dateFrom || options.dateTo
+          || options.project === 'inbox';
+        const earlyLimit = (!hasClientFilters && options.limit > 0) ? options.limit : 0;
+        D('runExport: hasClientFilters =', hasClientFilters, ', earlyLimit =', earlyLimit);
+
+        if (options.source === 'active' || options.source === 'both') {
+          D('runExport: listing ACTIVE conversations, earlyLimit =', earlyLimit);
+          progress('Listing active conversations…', 5);
+          const active = await listConversations(false, auth, earlyLimit);
+          D('runExport: active result count =', active.length);
+          all.push(...active.map((c) => ({ ...c, _source: 'active' })));
+        }
+        if (options.source === 'archived' || options.source === 'both') {
+          if (earlyLimit > 0 && all.length >= earlyLimit) {
+            D('runExport: skipping archived — earlyLimit already satisfied');
+          } else {
+            D('runExport: listing ARCHIVED conversations');
+            progress('Listing archived conversations…', 10);
+            await sleep(DELAY_MS);
+            const remaining = earlyLimit > 0 ? earlyLimit - all.length : 0;
+            const archived = await listConversations(true, auth, remaining);
+            D('runExport: archived result count =', archived.length);
+            all.push(...archived.map((c) => ({ ...c, _source: 'archived' })));
+          }
         }
       }
 
@@ -409,6 +415,51 @@ if (!window.__chatgptExportLoaded) {
     return projects;
   }
 
+  async function listProjectConversations(gizmoId, auth) {
+    D('listProjectConversations: gizmoId =', gizmoId);
+    // The /conversations endpoint ignores gizmo_id and returns gizmo_id=null.
+    // Project conversations must be fetched through the gizmo sidebar or a gizmo-specific endpoint.
+    // Try the gizmo conversations endpoint first, fall back to sidebar with high limit.
+
+    // Approach 1: Try /gizmos/{id}/conversations (undocumented)
+    try {
+      D('listProjectConversations: trying /gizmos endpoint...');
+      let offset = 0;
+      let total = null;
+      const items = [];
+      while (total === null || offset < total) {
+        const url = `/gizmos/${gizmoId}/conversations?offset=${offset}&limit=${LIMIT}`;
+        const data = await api(url, auth);
+        total = data.total;
+        items.push(...(data.items || data.conversations || []));
+        D('listProjectConversations: page — total:', total, ', accumulated:', items.length);
+        offset += LIMIT;
+        if (offset < total) await sleep(DELAY_MS);
+      }
+      D('listProjectConversations: gizmo endpoint returned', items.length, 'conversations');
+      if (items.length > 0) return items;
+    } catch (e) {
+      D('listProjectConversations: gizmo endpoint failed:', e.message);
+    }
+
+    // Approach 2: Sidebar with high conversations_per_gizmo
+    D('listProjectConversations: falling back to sidebar approach...');
+    const sidebarData = await api(
+      `/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=200&limit=50`,
+      auth
+    );
+    const match = (sidebarData.items || []).find((item) => {
+      const id = item.gizmo?.gizmo?.id;
+      return id === gizmoId;
+    });
+    const convs = match?.conversations || [];
+    D('listProjectConversations: sidebar returned', convs.length, 'conversations for', gizmoId);
+    for (const c of convs) {
+      D('  sidebar conv:', c.id, '|', c.title);
+    }
+    return convs;
+  }
+
   // --- Archive / Unarchive ---
   let pendingConfirmResolve = null;
 
@@ -438,12 +489,19 @@ if (!window.__chatgptExportLoaded) {
       const auth = await getAuth();
 
       const isArchived = !archive;
-      const gizmoId = (options.project && options.project !== 'all' && options.project !== 'inbox')
-        ? options.project : null;
-      D('runArchiveAction: isArchived =', isArchived, ', gizmoId =', gizmoId);
-      progress(`Listing ${archive ? 'active' : 'archived'} conversations…`, 5);
-      const all = await listConversations(isArchived, auth, 0, gizmoId);
-      const tagged = all.map((c) => ({ ...c, _source: isArchived ? 'archived' : 'active' }));
+      const isProjectFilter = options.project && options.project !== 'all' && options.project !== 'inbox';
+      D('runArchiveAction: isArchived =', isArchived, ', isProjectFilter =', isProjectFilter);
+
+      let tagged;
+      if (isProjectFilter) {
+        progress('Listing project conversations…', 5);
+        const projectConvs = await listProjectConversations(options.project, auth);
+        tagged = projectConvs.map((c) => ({ ...c, _source: 'active' }));
+      } else {
+        progress(`Listing ${archive ? 'active' : 'archived'} conversations…`, 5);
+        const all = await listConversations(isArchived, auth);
+        tagged = all.map((c) => ({ ...c, _source: isArchived ? 'archived' : 'active' }));
+      }
       D('runArchiveAction: listed', tagged.length, 'conversations');
 
       const filtered = filterConversations(tagged, options);
