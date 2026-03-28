@@ -93,7 +93,7 @@
     #log-container {
       display: none;
       margin-top: 10px;
-      max-height: 120px;
+      height: 120px;
       overflow-y: auto;
       background: #fff;
       border: 1px solid #e0e0e0;
@@ -161,9 +161,21 @@
     <input type="number" id="limit" value="0" min="0">
   </div>
 
+  <div class="field">
+    <label>Format</label>
+    <select id="format">
+      <option value="json">JSON — full backup, machine-readable</option>
+      <option value="markdown">Markdown — human-readable, AI-ready</option>
+      <option value="jsonl">JSONL — fine-tuning, embeddings</option>
+      <option value="html">HTML — viewable in browser</option>
+      <option value="csv">CSV — spreadsheet analysis</option>
+      <option value="txt">Plain text — simplest</option>
+    </select>
+  </div>
+
   <div class="checkbox-field">
     <input type="checkbox" id="attachments">
-    <label for="attachments">Include attachments &amp; images</label>
+    <label for="attachments">Include attachments &amp; images (JSON only)</label>
   </div>
 
   <button id="export-btn">Export</button>

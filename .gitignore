@@ -2,3 +2,9 @@
 *.crx
 *.pem
 *.zip
+.env
+credentials.json
+*.har
+*.key
+GEMINI.md
+.gemini/settings.json

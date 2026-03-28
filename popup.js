@@ -27,6 +27,7 @@ $('export-btn').addEventListener('click', async () => {
     keyword: $('keyword').value.trim() || null,
     limit: parseInt($('limit').value) || 0,
     attachments: $('attachments').checked,
+    format: $('format').value,
   };
 
   try {
@@ -35,10 +36,10 @@ $('export-btn').addEventListener('click', async () => {
       throw new Error('Open chatgpt.com first');
     }
 
-    // Inject content script (handles case where page was loaded before extension install)
+    // Inject scripts (handles case where page was loaded before extension install)
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      files: ['content.js'],
+      files: ['converters.js', 'content.js'],
     });
 
     // Small delay to let the script register its listener

@@ -249,7 +249,7 @@ if (!window.__chatgptExportLoaded) {
         if (i < filtered.length - 1) await sleep(DELAY_MS);
       }
 
-      progress('Building export file…', 92);
+      progress('Building export…', 92);
       const exportData = {
         exported_at: new Date().toISOString(),
         account: auth.accountId || 'unknown',
@@ -268,25 +268,35 @@ if (!window.__chatgptExportLoaded) {
           : {}),
       };
 
-      progress('Downloading…', 98);
-      const blob = new Blob([JSON.stringify(exportData, null, 2)], {
-        type: 'application/json',
-      });
+      const fmt = options.format || 'json';
+      const datestamp = new Date().toISOString().slice(0, 10);
+      const formats = {
+        json:     { ext: 'json',  mime: 'application/json',       fn: () => JSON.stringify(exportData, null, 2) },
+        markdown: { ext: 'md',    mime: 'text/markdown',          fn: () => toMarkdown(exportData) },
+        jsonl:    { ext: 'jsonl', mime: 'application/x-jsonlines', fn: () => toJSONL(exportData) },
+        html:     { ext: 'html',  mime: 'text/html',              fn: () => toHTML(exportData) },
+        csv:      { ext: 'csv',   mime: 'text/csv',               fn: () => toCSV(exportData) },
+        txt:      { ext: 'txt',   mime: 'text/plain',             fn: () => toPlainText(exportData) },
+      };
+
+      const { ext, mime, fn } = formats[fmt];
+      progress(`Generating ${ext.toUpperCase()}…`, 95);
+      const content = fn();
+
+      progress('Downloading…', 99);
+      const blob = new Blob([content], { type: mime });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `chatgpt-export-${new Date().toISOString().slice(0, 10)}.json`;
+      a.download = `chatgpt-export-${datestamp}.${ext}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
 
       done(
-        `Exported ${conversations.length} conversations` +
-          (errors.length ? `, ${errors.length} errors` : '') +
-          (Object.keys(attachmentMap).length
-            ? `, ${Object.keys(attachmentMap).length} with attachments`
-            : '')
+        `Exported ${conversations.length} conversations as ${ext.toUpperCase()}` +
+          (errors.length ? `, ${errors.length} errors` : '')
       );
     } catch (e) {
       error(e.message);
