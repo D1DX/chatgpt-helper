@@ -71,6 +71,14 @@ if (!window.__chatgptExportLoaded) {
   function filterConversations(items, options) {
     let filtered = items;
 
+    if (options.project && options.project !== 'all') {
+      if (options.project === 'inbox') {
+        filtered = filtered.filter((c) => !c.gizmo_id);
+      } else {
+        filtered = filtered.filter((c) => c.gizmo_id === options.project);
+      }
+    }
+
     if (options.keyword) {
       const kw = options.keyword.toLowerCase();
       filtered = filtered.filter(
@@ -303,8 +311,32 @@ if (!window.__chatgptExportLoaded) {
     }
   }
 
+  async function listProjects() {
+    const auth = await getAuth();
+    const data = await api(
+      '/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=0&limit=50',
+      auth
+    );
+    return (data.items || []).map((item) => {
+      const g = item.gizmo?.gizmo || {};
+      const display = g.display || {};
+      return {
+        id: g.id,
+        name: display.name || 'Untitled',
+        emoji: display.emoji || '',
+        interactions: g.num_interactions || 0,
+      };
+    });
+  }
+
   // Listen for messages from popup
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.action === 'list-projects') {
+      listProjects()
+        .then((projects) => sendResponse({ projects }))
+        .catch(() => sendResponse({ projects: [] }));
+      return true; // keep channel open for async response
+    }
     if (msg.action === 'export') {
       runExport(msg.options);
       sendResponse({ ok: true });

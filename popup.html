@@ -132,6 +132,15 @@
   <h1>ChatGPT Export <span class="badge">D1DX</span></h1>
 
   <div class="field">
+    <label>Project</label>
+    <select id="project">
+      <option value="all">All conversations</option>
+      <option value="inbox">No project (inbox only)</option>
+    </select>
+    <div id="project-loading" style="font-size:10px;color:#999;margin-top:2px;">Loading projects…</div>
+  </div>
+
+  <div class="field">
     <label>Source</label>
     <select id="source">
       <option value="active">Active conversations</option>

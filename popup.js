@@ -9,6 +9,41 @@ function log(text) {
   container.scrollTop = container.scrollHeight;
 }
 
+// Load projects on popup open
+(async () => {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.url?.startsWith('https://chatgpt.com')) {
+      $('project-loading').textContent = 'Open chatgpt.com to load projects';
+      return;
+    }
+
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['converters.js', 'content.js'],
+    });
+    await new Promise((r) => setTimeout(r, 100));
+
+    chrome.tabs.sendMessage(tab.id, { action: 'list-projects' }, (response) => {
+      const el = $('project');
+      const loading = $('project-loading');
+      if (chrome.runtime.lastError || !response?.projects) {
+        loading.textContent = 'Could not load projects';
+        return;
+      }
+      for (const p of response.projects) {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = `${p.emoji ? p.emoji + ' ' : ''}${p.name} (${p.interactions})`;
+        el.appendChild(opt);
+      }
+      loading.style.display = 'none';
+    });
+  } catch {
+    $('project-loading').textContent = 'Could not load projects';
+  }
+})();
+
 $('export-btn').addEventListener('click', async () => {
   const btn = $('export-btn');
   btn.disabled = true;
@@ -28,6 +63,7 @@ $('export-btn').addEventListener('click', async () => {
     limit: parseInt($('limit').value) || 0,
     attachments: $('attachments').checked,
     format: $('format').value,
+    project: $('project').value,
   };
 
   try {
