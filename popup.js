@@ -24,7 +24,23 @@ $('export-btn').addEventListener('click', async () => {
       throw new Error('Open chatgpt.com first');
     }
 
-    chrome.tabs.sendMessage(tab.id, { action: 'export', options });
+    // Inject content script (handles case where page was loaded before extension install)
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['content.js'],
+    });
+
+    // Small delay to let the script register its listener
+    await new Promise((r) => setTimeout(r, 100));
+
+    chrome.tabs.sendMessage(tab.id, { action: 'export', options }, (response) => {
+      if (chrome.runtime.lastError) {
+        $('progress').textContent = 'Failed to connect. Refresh chatgpt.com and retry.';
+        $('progress').className = 'error';
+        btn.disabled = false;
+        btn.textContent = 'Export';
+      }
+    });
   } catch (e) {
     $('progress').textContent = e.message;
     $('progress').className = 'error';

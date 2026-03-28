@@ -103,6 +103,10 @@ No other permissions. No background processes. No data collection.
 
 ---
 
+### Disclaimer
+
+This extension is not affiliated with, endorsed by, or associated with OpenAI. It uses ChatGPT's internal web API, which is undocumented and may change without notice. Use at your own risk. The authors are not responsible for any consequences of using this tool, including but not limited to account restrictions or data loss. Always comply with OpenAI's Terms of Service.
+
 ### License
 
 MIT — see [LICENSE](LICENSE).
