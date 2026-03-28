@@ -183,8 +183,9 @@ if (!window.__chatgptExportLoaded) {
       progress('Authenticating…', 0);
       const auth = await getAuth();
 
-      // If no keyword/date filters, we can stop listing early
-      const hasFilters = options.keyword || options.dateFrom || options.dateTo;
+      // Only use early limit if no client-side filters will reduce the set
+      const hasFilters = options.keyword || options.dateFrom || options.dateTo
+        || (options.project && options.project !== 'all');
       const earlyLimit = (!hasFilters && options.limit > 0) ? options.limit : 0;
 
       let all = [];
