@@ -1,58 +1,48 @@
 # ChatGPT Helper
 
-A Chrome extension for managing your ChatGPT conversations. Export in 6 formats, bulk archive, and bulk unarchive — all with filters.
+[![Author](https://img.shields.io/badge/Author-Daniel_Rudaev-000000?style=flat)](https://github.com/daniel-rudaev)
+[![Studio](https://img.shields.io/badge/Studio-D1DX-000000?style=flat)](https://d1dx.com)
+[![Chrome](https://img.shields.io/badge/Chrome-Extension-4285F4?style=flat&logo=googlechrome&logoColor=white)](https://github.com/D1DX/chatgpt-helper)
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat)](./LICENSE)
 
-Built by [D1DX](https://d1dx.com) — operations automation studio.
+Chrome extension for managing ChatGPT conversations. Export in 6 formats, bulk archive, and bulk unarchive — all with filters.
 
----
+## What It Does
 
-### What It Does
+| Action | Description |
+| ------ | ----------- |
+| **Export** | Download conversations as JSON, Markdown, JSONL, HTML, CSV, or plain text |
+| **Archive** | Bulk archive active conversations matching your filters |
+| **Unarchive** | Bulk unarchive conversations by date, keyword, or project |
 
-**Export** — Download conversations as JSON, Markdown, JSONL, HTML, CSV, or plain text. Optionally includes file attachments (JSON format).
+All actions share the same filter panel: project, source, date range, keyword, and item limit.
 
-**Archive** — Bulk archive active conversations matching your filters. Clean up your inbox in one click.
+## How It Works
 
-**Unarchive** — Bulk unarchive conversations by date, keyword, or project. Undo accidental archives or retrieve old conversations.
-
-### How It Works
-
-1. The extension runs on `chatgpt.com` and authenticates using your active browser session
-2. It calls ChatGPT's internal API to list, fetch, archive, or unarchive conversations
-3. All filters (project, date range, keyword, limit) apply to every action
+1. Authenticates using your active ChatGPT browser session
+2. Calls ChatGPT's internal API to list, fetch, archive, or unarchive conversations
+3. Applies your filters client-side
 4. No data leaves your browser. No external servers. No telemetry.
 
----
+## Install
 
-### Install
+```
+git clone https://github.com/D1DX/chatgpt-helper.git
+```
 
-1. Download or clone this repo:
+1. Open Chrome → `chrome://extensions`
+2. Enable **Developer mode**
+3. Click **Load unpacked** → select the cloned folder
+4. The extension icon appears in your toolbar
 
-   ```
-   git clone https://github.com/d1dx/chatgpt-export.git
-   ```
+## Use
 
-2. Open Chrome and go to `chrome://extensions`
-3. Enable **Developer mode** (toggle in the top-right corner)
-4. Click **Load unpacked** and select the `chatgpt-export` folder
-5. The extension icon appears in your toolbar
-
-### Use
-
-1. Go to [chatgpt.com](https://chatgpt.com) and make sure you're logged in
-2. Click the extension icon in the toolbar
+1. Open [chatgpt.com](https://chatgpt.com) and log in
+2. Click the extension icon
 3. Choose a tab: **Export**, **Archive**, or **Unarchive**
-4. Set your filters:
-   - **Project** — all conversations, inbox only, or a specific project
-   - **Source** — active, archived, or both (auto-set for archive/unarchive)
-   - **Date range** — only conversations created within this window
-   - **Keyword** — filter by conversation title
-   - **Limit** — all matching, or a specific count
-5. Click the action button
-6. Archive and unarchive ask for confirmation before proceeding
+4. Set filters and click the action button
 
----
-
-### Export Formats
+## Export Formats
 
 | Format | Extension | Best for |
 | ------ | --------- | -------- |
@@ -60,12 +50,21 @@ Built by [D1DX](https://d1dx.com) — operations automation studio.
 | Markdown | `.md` | Reading, AI context windows, RAG |
 | JSONL | `.jsonl` | Fine-tuning, embeddings, batch processing |
 | HTML | `.html` | Browsable archive, sharing |
-| CSV | `.csv` | Spreadsheet analysis, searching |
-| Plain text | `.txt` | Simplest, grep-friendly |
+| CSV | `.csv` | Spreadsheet analysis |
+| Plain text | `.txt` | Grep-friendly, simplest |
 
----
+## Filters
 
-### Permissions
+| Filter | Scope | Notes |
+| ------ | ----- | ----- |
+| Project | Active only | Select a ChatGPT project or inbox |
+| Source | Export only | Active, archived, or both |
+| Date range | All actions | Filter by conversation creation date |
+| Keyword | All actions | Matches conversation title |
+| Limit | All actions | Cap the number of conversations processed |
+| Attachments | JSON export only | Include uploaded files and generated images |
+
+## Permissions
 
 | Permission | Why |
 | ---------- | --- |
@@ -75,21 +74,14 @@ Built by [D1DX](https://d1dx.com) — operations automation studio.
 
 No other permissions. No background processes. No data collection.
 
-### Privacy
+## Privacy
 
-- All processing happens locally in your browser
-- Your conversations are never sent to any external server
-- Authentication uses your existing ChatGPT session
-- The extension has no analytics, tracking, or telemetry
+All processing happens locally in your browser. Conversations are never sent to any external server. Authentication uses your existing ChatGPT session. No analytics, tracking, or telemetry.
 
-### Disclaimer
+## Disclaimer
 
 This extension is not affiliated with, endorsed by, or associated with OpenAI. It uses ChatGPT's internal web API, which is undocumented and may change without notice. Use at your own risk. The authors are not responsible for any consequences of using this tool, including but not limited to account restrictions or data loss. Always comply with OpenAI's Terms of Service.
 
-### License
+## License
 
-MIT — see [LICENSE](LICENSE).
-
-### Credits
-
-Built by [D1DX](https://d1dx.com). Open source under the [d1dx](https://github.com/d1dx) GitHub organization.
+MIT License — Copyright (c) 2026 Daniel Rudaev @ D1DX
