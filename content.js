@@ -48,20 +48,18 @@ if (!window.__chatgptExportLoaded) {
     return res.json();
   }
 
-  async function listConversations(archived, auth, maxItems = 0) {
+  async function listConversations(archived, auth, maxItems = 0, gizmoId = null) {
     let offset = 0;
     let total = null;
     const items = [];
     const pageSize = maxItems > 0 ? Math.min(LIMIT, maxItems) : LIMIT;
     while (total === null || offset < total) {
-      const data = await api(
-        `/conversations?offset=${offset}&limit=${pageSize}&order=updated&is_archived=${archived}&is_starred=false`,
-        auth
-      );
+      let url = `/conversations?offset=${offset}&limit=${pageSize}&order=updated&is_archived=${archived}&is_starred=false`;
+      if (gizmoId) url += `&gizmo_id=${gizmoId}`;
+      const data = await api(url, auth);
       total = data.total;
       items.push(...data.items);
       offset += pageSize;
-      // Stop early if we have enough
       if (maxItems > 0 && items.length >= maxItems) break;
       if (offset < total) await sleep(DELAY_MS);
     }
@@ -183,26 +181,29 @@ if (!window.__chatgptExportLoaded) {
       progress('Authenticating…', 0);
       const auth = await getAuth();
 
-      // Only use early limit if no client-side filters will reduce the set
-      const hasFilters = options.keyword || options.dateFrom || options.dateTo
-        || (options.project && options.project !== 'all');
-      const earlyLimit = (!hasFilters && options.limit > 0) ? options.limit : 0;
+      // Server-side gizmo filter (project conversations are separate in the API)
+      const gizmoId = (options.project && options.project !== 'all' && options.project !== 'inbox')
+        ? options.project : null;
+
+      // Early limit only when no client-side filters will reduce the set
+      const hasClientFilters = options.keyword || options.dateFrom || options.dateTo
+        || options.project === 'inbox';
+      const earlyLimit = (!hasClientFilters && options.limit > 0) ? options.limit : 0;
 
       let all = [];
       if (options.source === 'active' || options.source === 'both') {
         progress('Listing active conversations…', 5);
-        const active = await listConversations(false, auth, earlyLimit);
+        const active = await listConversations(false, auth, earlyLimit, gizmoId);
         all.push(...active.map((c) => ({ ...c, _source: 'active' })));
       }
       if (options.source === 'archived' || options.source === 'both') {
-        // Skip if early limit already satisfied from active
         if (earlyLimit > 0 && all.length >= earlyLimit) {
           // already have enough
         } else {
           progress('Listing archived conversations…', 10);
           await sleep(DELAY_MS);
           const remaining = earlyLimit > 0 ? earlyLimit - all.length : 0;
-          const archived = await listConversations(true, auth, remaining);
+          const archived = await listConversations(true, auth, remaining, gizmoId);
           all.push(...archived.map((c) => ({ ...c, _source: 'archived' })));
         }
       }
@@ -356,8 +357,10 @@ if (!window.__chatgptExportLoaded) {
 
       // For archive: list active. For unarchive: list archived.
       const isArchived = !archive;
+      const gizmoId = (options.project && options.project !== 'all' && options.project !== 'inbox')
+        ? options.project : null;
       progress(`Listing ${archive ? 'active' : 'archived'} conversations…`, 5);
-      const all = await listConversations(isArchived, auth);
+      const all = await listConversations(isArchived, auth, 0, gizmoId);
       const tagged = all.map((c) => ({ ...c, _source: isArchived ? 'archived' : 'active' }));
 
       const filtered = filterConversations(tagged, options);
