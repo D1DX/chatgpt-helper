@@ -27,9 +27,9 @@ function updateUI() {
   if (currentTab === 'unarchive') $('source').value = 'archived';
   if (currentTab === 'archive') $('source').value = 'active';
 
-  // Project: only relevant when source includes active conversations
-  const sourceIsArchived = $('source').value === 'archived' || currentTab === 'unarchive';
-  $('project-field').classList.toggle('hidden', sourceIsArchived);
+  // Project: only show when source is strictly "active"
+  const showProject = $('source').value === 'active' && currentTab !== 'unarchive';
+  $('project-field').classList.toggle('hidden', !showProject);
   if (sourceIsArchived) $('project').value = 'all';
 
   // Export-only options
