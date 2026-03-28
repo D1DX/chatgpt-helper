@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "ChatGPT Export",
-  "version": "1.0.0",
-  "description": "Export all your ChatGPT conversations — with filters, attachments, and full message history.",
+  "name": "ChatGPT Helper",
+  "version": "2.0.0",
+  "description": "Export, archive, and unarchive ChatGPT conversations — with filters, multiple formats, and attachments.",
   "permissions": ["activeTab", "scripting"],
   "host_permissions": ["https://chatgpt.com/*"],
   "action": {

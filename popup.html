@@ -5,7 +5,7 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      width: 320px;
+      width: 340px;
       font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
       background: #F5F7FA;
       color: #4A4A4A;
@@ -15,7 +15,7 @@
       font-size: 15px;
       font-weight: 600;
       color: #005490;
-      margin-bottom: 12px;
+      margin-bottom: 14px;
     }
     .badge {
       display: inline-block;
@@ -28,15 +28,39 @@
       margin-left: 6px;
       vertical-align: middle;
     }
+
+    /* Tabs */
+    .tabs {
+      display: flex;
+      gap: 0;
+      margin-bottom: 14px;
+      border-bottom: 2px solid #e0e0e0;
+    }
+    .tab {
+      flex: 1;
+      padding: 8px 0;
+      font-size: 12px;
+      font-weight: 600;
+      text-align: center;
+      cursor: pointer;
+      color: #999;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -2px;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    .tab:hover { color: #666; }
+    .tab.active { color: #005490; border-bottom-color: #005490; }
+
+    /* Fields */
     label {
       display: block;
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 500;
-      margin-bottom: 4px;
-      color: #4A4A4A;
+      margin-bottom: 3px;
+      color: #666;
     }
     .field { margin-bottom: 10px; }
-    select, input {
+    select, input[type="date"], input[type="text"], input[type="number"] {
       width: 100%;
       padding: 6px 8px;
       font-size: 12px;
@@ -53,22 +77,35 @@
       gap: 6px;
       margin-bottom: 10px;
     }
-    .checkbox-field input { width: auto; }
-    .checkbox-field label { margin: 0; }
+    .checkbox-field input[type="checkbox"] { width: auto; margin: 0; }
+    .checkbox-field label { margin: 0; font-size: 12px; }
+    .hint {
+      font-size: 10px;
+      color: #999;
+      margin-top: 2px;
+    }
+
+    /* Buttons */
+    .actions { margin-top: 4px; }
     button {
       width: 100%;
       padding: 10px;
       font-size: 13px;
       font-weight: 600;
       color: #fff;
-      background: #005490;
       border: none;
       border-radius: 4px;
       cursor: pointer;
-      margin-top: 4px;
     }
-    button:hover { background: #003d6b; }
-    button:disabled { background: #999; cursor: not-allowed; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: #005490; }
+    .btn-primary:hover:not(:disabled) { background: #003d6b; }
+    .btn-warning { background: #e67e22; }
+    .btn-warning:hover:not(:disabled) { background: #d35400; }
+    .btn-success { background: #0FB5A9; }
+    .btn-success:hover:not(:disabled) { background: #0a8f86; }
+
+    /* Progress */
     #progress {
       margin-top: 10px;
       font-size: 11px;
@@ -90,6 +127,8 @@
       transition: width 0.3s;
     }
     .error { color: #c0392b; }
+
+    /* Log */
     #log-container {
       display: none;
       margin-top: 10px;
@@ -108,6 +147,8 @@
       white-space: pre-wrap;
       word-break: break-all;
     }
+
+    /* Footer */
     .disclaimer {
       margin-top: 10px;
       padding: 6px 8px;
@@ -118,7 +159,7 @@
       line-height: 1.4;
     }
     .footer {
-      margin-top: 12px;
+      margin-top: 10px;
       padding-top: 8px;
       border-top: 1px solid #e0e0e0;
       font-size: 10px;
@@ -126,26 +167,36 @@
       text-align: center;
     }
     .footer a { color: #005490; text-decoration: none; }
+
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
-  <h1>ChatGPT Export <span class="badge">D1DX</span></h1>
+  <h1>ChatGPT Helper <span class="badge">D1DX</span></h1>
 
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" data-tab="export">Export</div>
+    <div class="tab" data-tab="archive">Archive</div>
+    <div class="tab" data-tab="unarchive">Unarchive</div>
+  </div>
+
+  <!-- Shared filters -->
   <div class="field">
     <label>Project</label>
     <select id="project">
       <option value="all">All conversations</option>
-      <option value="inbox">No project (inbox only)</option>
+      <option value="inbox">Inbox (no project)</option>
     </select>
-    <div id="project-loading" style="font-size:10px;color:#999;margin-top:2px;">Loading projects…</div>
+    <div id="project-loading" class="hint">Loading projects…</div>
   </div>
 
-  <div class="field">
+  <div class="field" id="source-field">
     <label>Source</label>
     <select id="source">
-      <option value="active">Active conversations</option>
-      <option value="archived">Archived conversations</option>
-      <option value="both" selected>Both (active + archived)</option>
+      <option value="active">Active</option>
+      <option value="archived">Archived</option>
+      <option value="both" selected>Both</option>
     </select>
   </div>
 
@@ -161,33 +212,46 @@
   </div>
 
   <div class="field">
-    <label>Keyword filter</label>
-    <input type="text" id="keyword" placeholder="Filter by title (optional)">
-  </div>
-
-  <div class="field">
-    <label>Max conversations (0 = all)</label>
-    <input type="number" id="limit" value="0" min="0">
-  </div>
-
-  <div class="field">
-    <label>Format</label>
-    <select id="format">
-      <option value="json">JSON — full backup, machine-readable</option>
-      <option value="markdown">Markdown — human-readable, AI-ready</option>
-      <option value="jsonl">JSONL — fine-tuning, embeddings</option>
-      <option value="html">HTML — viewable in browser</option>
-      <option value="csv">CSV — spreadsheet analysis</option>
-      <option value="txt">Plain text — simplest</option>
-    </select>
+    <label>Keyword</label>
+    <input type="text" id="keyword" placeholder="Filter by title">
   </div>
 
   <div class="checkbox-field">
-    <input type="checkbox" id="attachments">
-    <label for="attachments">Include attachments &amp; images (JSON only)</label>
+    <input type="checkbox" id="export-all" checked>
+    <label for="export-all">All matching conversations</label>
   </div>
 
-  <button id="export-btn">Export</button>
+  <div class="field hidden" id="limit-field">
+    <label>Max conversations</label>
+    <input type="number" id="limit" value="10" min="1">
+  </div>
+
+  <!-- Export-only options -->
+  <div id="export-options">
+    <div class="field">
+      <label>Format</label>
+      <select id="format">
+        <option value="json">JSON — full backup</option>
+        <option value="markdown">Markdown — AI-ready</option>
+        <option value="jsonl">JSONL — fine-tuning</option>
+        <option value="html">HTML — browser viewable</option>
+        <option value="csv">CSV — spreadsheet</option>
+        <option value="txt">Plain text</option>
+      </select>
+    </div>
+
+    <div class="checkbox-field" id="attachments-field">
+      <input type="checkbox" id="attachments">
+      <label for="attachments">Include attachments &amp; images</label>
+    </div>
+  </div>
+
+  <!-- Action buttons -->
+  <div class="actions">
+    <button id="export-btn" class="btn-primary">Export</button>
+    <button id="archive-btn" class="btn-warning hidden">Archive matching</button>
+    <button id="unarchive-btn" class="btn-success hidden">Unarchive matching</button>
+  </div>
 
   <div id="progress"></div>
   <div id="progress-bar-container"><div id="progress-bar"></div></div>

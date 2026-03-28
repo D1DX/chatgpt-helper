@@ -9,20 +9,67 @@ function log(text) {
   container.scrollTop = container.scrollHeight;
 }
 
-// Load projects on popup open
+// --- Tab switching ---
+let currentTab = 'export';
+
+document.querySelectorAll('.tab').forEach((tab) => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
+    tab.classList.add('active');
+    currentTab = tab.dataset.tab;
+    updateUI();
+  });
+});
+
+function updateUI() {
+  // Source field: hide for unarchive (always archived), show for others
+  $('source-field').classList.toggle('hidden', currentTab === 'unarchive');
+  if (currentTab === 'unarchive') $('source').value = 'archived';
+  if (currentTab === 'archive') $('source').value = 'active';
+
+  // Export-only options
+  $('export-options').classList.toggle('hidden', currentTab !== 'export');
+
+  // Buttons
+  $('export-btn').classList.toggle('hidden', currentTab !== 'export');
+  $('archive-btn').classList.toggle('hidden', currentTab !== 'archive');
+  $('unarchive-btn').classList.toggle('hidden', currentTab !== 'unarchive');
+
+  // Attachments only for JSON
+  updateAttachmentsVisibility();
+}
+
+function updateAttachmentsVisibility() {
+  $('attachments-field').classList.toggle('hidden', $('format').value !== 'json');
+}
+
+$('format').addEventListener('change', updateAttachmentsVisibility);
+
+// --- Export all toggle ---
+$('export-all').addEventListener('change', () => {
+  $('limit-field').classList.toggle('hidden', $('export-all').checked);
+});
+
+// --- Load projects on popup open ---
+async function injectAndGetTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.url?.startsWith('https://chatgpt.com')) return null;
+
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    files: ['converters.js', 'content.js'],
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  return tab;
+}
+
 (async () => {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.url?.startsWith('https://chatgpt.com')) {
+    const tab = await injectAndGetTab();
+    if (!tab) {
       $('project-loading').textContent = 'Open chatgpt.com to load projects';
       return;
     }
-
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['converters.js', 'content.js'],
-    });
-    await new Promise((r) => setTimeout(r, 100));
 
     chrome.tabs.sendMessage(tab.id, { action: 'list-projects' }, (response) => {
       const el = $('project');
@@ -34,7 +81,7 @@ function log(text) {
       for (const p of response.projects) {
         const opt = document.createElement('option');
         opt.value = p.id;
-        opt.textContent = `${p.emoji ? p.emoji + ' ' : ''}${p.name} (${p.interactions})`;
+        opt.textContent = p.name;
         el.appendChild(opt);
       }
       loading.style.display = 'none';
@@ -44,78 +91,86 @@ function log(text) {
   }
 })();
 
-$('export-btn').addEventListener('click', async () => {
-  const btn = $('export-btn');
-  btn.disabled = true;
-  btn.textContent = 'Exporting…';
+// --- Gather current filter options ---
+function getOptions() {
+  return {
+    project: $('project').value,
+    source: currentTab === 'unarchive' ? 'archived' : currentTab === 'archive' ? 'active' : $('source').value,
+    dateFrom: $('date-from').value || null,
+    dateTo: $('date-to').value || null,
+    keyword: $('keyword').value.trim() || null,
+    limit: $('export-all').checked ? 0 : (parseInt($('limit').value) || 0),
+    attachments: $('attachments').checked && $('format').value === 'json',
+    format: $('format').value,
+  };
+}
+
+// --- Send action to content script ---
+async function sendAction(action) {
+  const options = getOptions();
+  const btns = ['export-btn', 'archive-btn', 'unarchive-btn'];
+  btns.forEach((id) => { $(id).disabled = true; });
   $('progress').textContent = 'Starting…';
   $('progress').className = '';
   $('progress-bar-container').style.display = 'block';
   $('progress-bar').style.width = '0%';
   $('log').textContent = '';
-  log('Export started');
-
-  const options = {
-    source: $('source').value,
-    dateFrom: $('date-from').value || null,
-    dateTo: $('date-to').value || null,
-    keyword: $('keyword').value.trim() || null,
-    limit: parseInt($('limit').value) || 0,
-    attachments: $('attachments').checked,
-    format: $('format').value,
-    project: $('project').value,
-  };
+  log(`${action} started`);
 
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.url?.startsWith('https://chatgpt.com')) {
-      throw new Error('Open chatgpt.com first');
-    }
+    const tab = await injectAndGetTab();
+    if (!tab) throw new Error('Open chatgpt.com first');
 
-    // Inject scripts (handles case where page was loaded before extension install)
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['converters.js', 'content.js'],
-    });
-
-    // Small delay to let the script register its listener
-    await new Promise((r) => setTimeout(r, 100));
-
-    chrome.tabs.sendMessage(tab.id, { action: 'export', options }, (response) => {
+    chrome.tabs.sendMessage(tab.id, { action, options }, (response) => {
       if (chrome.runtime.lastError) {
         $('progress').textContent = 'Failed to connect. Refresh chatgpt.com and retry.';
         $('progress').className = 'error';
-        btn.disabled = false;
-        btn.textContent = 'Export';
+        btns.forEach((id) => { $(id).disabled = false; });
       }
     });
   } catch (e) {
     $('progress').textContent = e.message;
     $('progress').className = 'error';
-    btn.disabled = false;
-    btn.textContent = 'Export';
+    btns.forEach((id) => { $(id).disabled = false; });
   }
-});
+}
 
-// Listen for progress updates from content script
+$('export-btn').addEventListener('click', () => sendAction('export'));
+$('archive-btn').addEventListener('click', () => sendAction('archive'));
+$('unarchive-btn').addEventListener('click', () => sendAction('unarchive'));
+
+// --- Listen for progress updates ---
 chrome.runtime.onMessage.addListener((msg) => {
+  const btns = ['export-btn', 'archive-btn', 'unarchive-btn'];
   if (msg.type === 'progress') {
     $('progress').textContent = msg.text;
     log(msg.text);
     if (msg.percent !== undefined) {
       $('progress-bar').style.width = msg.percent + '%';
     }
+  } else if (msg.type === 'confirm') {
+    // Archive/unarchive confirmation
+    const ok = confirm(msg.text);
+    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+      chrome.tabs.sendMessage(tab.id, { action: 'confirm-response', confirmed: ok });
+    });
+    if (!ok) {
+      $('progress').textContent = 'Cancelled.';
+      log('Cancelled by user');
+      btns.forEach((id) => { $(id).disabled = false; });
+    }
   } else if (msg.type === 'done') {
     $('progress').textContent = msg.text;
     $('progress-bar').style.width = '100%';
     log(msg.text);
-    $('export-btn').disabled = false;
-    $('export-btn').textContent = 'Export';
+    btns.forEach((id) => { $(id).disabled = false; });
   } else if (msg.type === 'error') {
     $('progress').textContent = msg.text;
     $('progress').className = 'error';
     log('ERROR: ' + msg.text);
-    $('export-btn').disabled = false;
-    $('export-btn').textContent = 'Export';
+    btns.forEach((id) => { $(id).disabled = false; });
   }
 });
+
+// Init
+updateUI();

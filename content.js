@@ -329,17 +329,107 @@ if (!window.__chatgptExportLoaded) {
     });
   }
 
+  // --- Archive / Unarchive ---
+  let pendingConfirmResolve = null;
+
+  async function setArchived(conversationId, archived, auth) {
+    const res = await fetch(`/backend-api/conversation/${conversationId}`, {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${auth.token}`,
+        ...(auth.accountId ? { 'chatgpt-account-id': auth.accountId } : {}),
+      },
+      body: JSON.stringify({ is_archived: archived }),
+    });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  async function runArchiveAction(options, archive) {
+    const verb = archive ? 'Archive' : 'Unarchive';
+    try {
+      progress('Authenticating…', 0);
+      const auth = await getAuth();
+
+      // For archive: list active. For unarchive: list archived.
+      const isArchived = !archive;
+      progress(`Listing ${archive ? 'active' : 'archived'} conversations…`, 5);
+      const all = await listConversations(isArchived, auth);
+      const tagged = all.map((c) => ({ ...c, _source: isArchived ? 'archived' : 'active' }));
+
+      const filtered = filterConversations(tagged, options);
+      progress(`Found ${filtered.length} conversations to ${verb.toLowerCase()}`, 15);
+
+      if (filtered.length === 0) {
+        done(`No conversations match your filters.`);
+        return;
+      }
+
+      // Ask for confirmation via popup
+      try {
+        chrome.runtime.sendMessage({
+          type: 'confirm',
+          text: `${verb} ${filtered.length} conversation${filtered.length > 1 ? 's' : ''}?`,
+        });
+      } catch {}
+
+      // Wait for confirmation
+      const confirmed = await new Promise((resolve) => {
+        pendingConfirmResolve = resolve;
+      });
+      pendingConfirmResolve = null;
+
+      if (!confirmed) return;
+
+      // Execute
+      let successCount = 0;
+      const errors = [];
+      for (let i = 0; i < filtered.length; i++) {
+        const c = filtered[i];
+        const pct = 15 + Math.round((i / filtered.length) * 80);
+        progress(`[${i + 1}/${filtered.length}] ${c.title || 'untitled'}`, pct);
+        try {
+          await setArchived(c.id, archive, auth);
+          successCount++;
+        } catch (e) {
+          errors.push({ id: c.id, title: c.title, error: e.message });
+        }
+        if (i < filtered.length - 1) await sleep(DELAY_MS);
+      }
+
+      done(
+        `${verb}d ${successCount} conversations` +
+          (errors.length ? `, ${errors.length} errors` : '')
+      );
+    } catch (e) {
+      error(e.message);
+    }
+  }
+
   // Listen for messages from popup
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === 'list-projects') {
       listProjects()
         .then((projects) => sendResponse({ projects }))
         .catch(() => sendResponse({ projects: [] }));
-      return true; // keep channel open for async response
+      return true;
     }
     if (msg.action === 'export') {
       runExport(msg.options);
       sendResponse({ ok: true });
+    }
+    if (msg.action === 'archive') {
+      runArchiveAction(msg.options, true);
+      sendResponse({ ok: true });
+    }
+    if (msg.action === 'unarchive') {
+      runArchiveAction(msg.options, false);
+      sendResponse({ ok: true });
+    }
+    if (msg.action === 'confirm-response') {
+      if (pendingConfirmResolve) pendingConfirmResolve(msg.confirmed);
     }
   });
 }
