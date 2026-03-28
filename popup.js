@@ -1,5 +1,14 @@
 const $ = (id) => document.getElementById(id);
 
+function log(text) {
+  const container = $('log-container');
+  const el = $('log');
+  container.style.display = 'block';
+  const ts = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  el.textContent += `[${ts}] ${text}\n`;
+  container.scrollTop = container.scrollHeight;
+}
+
 $('export-btn').addEventListener('click', async () => {
   const btn = $('export-btn');
   btn.disabled = true;
@@ -8,6 +17,8 @@ $('export-btn').addEventListener('click', async () => {
   $('progress').className = '';
   $('progress-bar-container').style.display = 'block';
   $('progress-bar').style.width = '0%';
+  $('log').textContent = '';
+  log('Export started');
 
   const options = {
     source: $('source').value,
@@ -53,17 +64,20 @@ $('export-btn').addEventListener('click', async () => {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'progress') {
     $('progress').textContent = msg.text;
+    log(msg.text);
     if (msg.percent !== undefined) {
       $('progress-bar').style.width = msg.percent + '%';
     }
   } else if (msg.type === 'done') {
     $('progress').textContent = msg.text;
     $('progress-bar').style.width = '100%';
+    log(msg.text);
     $('export-btn').disabled = false;
     $('export-btn').textContent = 'Export';
   } else if (msg.type === 'error') {
     $('progress').textContent = msg.text;
     $('progress').className = 'error';
+    log('ERROR: ' + msg.text);
     $('export-btn').disabled = false;
     $('export-btn').textContent = 'Export';
   }

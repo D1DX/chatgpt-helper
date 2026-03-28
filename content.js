@@ -48,21 +48,24 @@ if (!window.__chatgptExportLoaded) {
     return res.json();
   }
 
-  async function listConversations(archived, auth) {
+  async function listConversations(archived, auth, maxItems = 0) {
     let offset = 0;
     let total = null;
     const items = [];
+    const pageSize = maxItems > 0 ? Math.min(LIMIT, maxItems) : LIMIT;
     while (total === null || offset < total) {
       const data = await api(
-        `/conversations?offset=${offset}&limit=${LIMIT}&order=updated&is_archived=${archived}&is_starred=false`,
+        `/conversations?offset=${offset}&limit=${pageSize}&order=updated&is_archived=${archived}&is_starred=false`,
         auth
       );
       total = data.total;
       items.push(...data.items);
-      offset += LIMIT;
+      offset += pageSize;
+      // Stop early if we have enough
+      if (maxItems > 0 && items.length >= maxItems) break;
       if (offset < total) await sleep(DELAY_MS);
     }
-    return items;
+    return maxItems > 0 ? items.slice(0, maxItems) : items;
   }
 
   function filterConversations(items, options) {
@@ -172,17 +175,27 @@ if (!window.__chatgptExportLoaded) {
       progress('Authenticating…', 0);
       const auth = await getAuth();
 
+      // If no keyword/date filters, we can stop listing early
+      const hasFilters = options.keyword || options.dateFrom || options.dateTo;
+      const earlyLimit = (!hasFilters && options.limit > 0) ? options.limit : 0;
+
       let all = [];
       if (options.source === 'active' || options.source === 'both') {
         progress('Listing active conversations…', 5);
-        const active = await listConversations(false, auth);
+        const active = await listConversations(false, auth, earlyLimit);
         all.push(...active.map((c) => ({ ...c, _source: 'active' })));
       }
       if (options.source === 'archived' || options.source === 'both') {
-        progress('Listing archived conversations…', 10);
-        await sleep(DELAY_MS);
-        const archived = await listConversations(true, auth);
-        all.push(...archived.map((c) => ({ ...c, _source: 'archived' })));
+        // Skip if early limit already satisfied from active
+        if (earlyLimit > 0 && all.length >= earlyLimit) {
+          // already have enough
+        } else {
+          progress('Listing archived conversations…', 10);
+          await sleep(DELAY_MS);
+          const remaining = earlyLimit > 0 ? earlyLimit - all.length : 0;
+          const archived = await listConversations(true, auth, remaining);
+          all.push(...archived.map((c) => ({ ...c, _source: 'archived' })));
+        }
       }
 
       const seen = new Set();

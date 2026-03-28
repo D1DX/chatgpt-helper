@@ -90,6 +90,24 @@
       transition: width 0.3s;
     }
     .error { color: #c0392b; }
+    #log-container {
+      display: none;
+      margin-top: 10px;
+      max-height: 120px;
+      overflow-y: auto;
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 4px;
+      padding: 6px 8px;
+    }
+    #log {
+      font-family: 'SF Mono', Menlo, monospace;
+      font-size: 10px;
+      color: #666;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
     .disclaimer {
       margin-top: 10px;
       padding: 6px 8px;
@@ -152,6 +170,10 @@
 
   <div id="progress"></div>
   <div id="progress-bar-container"><div id="progress-bar"></div></div>
+
+  <div id="log-container">
+    <div id="log"></div>
+  </div>
 
   <div class="disclaimer">
     Not affiliated with OpenAI. Uses an unofficial API that may change without notice.
