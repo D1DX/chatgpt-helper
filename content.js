@@ -11,31 +11,19 @@ if (!window.__chatgptExportLoaded) {
 
   const D = (...args) => console.log('[ChatGPT Helper]', ...args);
 
-  // Single function to update state — always merges, never overwrites logs
-  function updateState(fields, logText) {
-    chrome.storage.local.get('helperState', (data) => {
-      const s = data.helperState || {};
-      const ts = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      const logs = (s.logs || '') + (logText ? `[${ts}] ${logText}\n` : '');
-      chrome.storage.local.set({ helperState: { ...s, ...fields, logs } });
-    });
-  }
 
   function progress(text, percent) {
     D('PROGRESS:', text, percent !== undefined ? `${percent}%` : '');
-    updateState({ status: 'running', progress: text, percent, running: true }, text);
     try { chrome.runtime.sendMessage({ type: 'progress', text, percent }); } catch {}
   }
 
   function done(text) {
     D('DONE:', text);
-    updateState({ status: 'done', progress: text, percent: 100, running: false }, text);
     try { chrome.runtime.sendMessage({ type: 'done', text }); } catch {}
   }
 
   function error(text) {
     D('ERROR:', text);
-    updateState({ status: 'error', progress: text, percent: 0, running: false }, 'ERROR: ' + text);
     try { chrome.runtime.sendMessage({ type: 'error', text }); } catch {}
   }
 
@@ -246,7 +234,6 @@ if (!window.__chatgptExportLoaded) {
   async function runExport(options) {
     D('========== runExport START ==========');
     D('runExport: options =', JSON.stringify(options, null, 2));
-    chrome.storage.local.set({ helperState: { status: 'running', progress: 'Starting…', percent: 0, running: true, logs: '' } });
     try {
       progress('Authenticating…', 0);
       const auth = await getAuth();
@@ -498,7 +485,6 @@ if (!window.__chatgptExportLoaded) {
     const verb = archive ? 'Archive' : 'Unarchive';
     D('========== runArchiveAction START ==========');
     D('runArchiveAction: verb =', verb, ', options =', JSON.stringify(options, null, 2));
-    chrome.storage.local.set({ helperState: { status: 'running', progress: 'Starting…', percent: 0, running: true, logs: '' } });
     try {
       progress('Authenticating…', 0);
       const auth = await getAuth();
