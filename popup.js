@@ -27,6 +27,11 @@ function updateUI() {
   if (currentTab === 'unarchive') $('source').value = 'archived';
   if (currentTab === 'archive') $('source').value = 'active';
 
+  // Project: only relevant when source includes active conversations
+  const sourceIsArchived = $('source').value === 'archived' || currentTab === 'unarchive';
+  $('project-field').classList.toggle('hidden', sourceIsArchived);
+  if (sourceIsArchived) $('project').value = 'all';
+
   // Export-only options
   $('export-options').classList.toggle('hidden', currentTab !== 'export');
 
@@ -38,6 +43,8 @@ function updateUI() {
   // Attachments only for JSON
   updateAttachmentsVisibility();
 }
+
+$('source').addEventListener('change', updateUI);
 
 function updateAttachmentsVisibility() {
   $('attachments-field').classList.toggle('hidden', $('format').value !== 'json');
