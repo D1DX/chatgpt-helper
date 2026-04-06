@@ -5,26 +5,44 @@
 if (!window.__chatgptExportLoaded) {
   window.__chatgptExportLoaded = true;
 
-  const LIMIT = 28;
-  const DELAY_MS = 800;
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const LIMIT = 100;
+  const DELAY_INITIAL = 800;
+  const DELAY_MAX = 60000;
 
+  let delayMs = DELAY_INITIAL;
+  let abortRequested = false;
+  let running = false;
+  let lastStatus = null;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const D = (...args) => console.log('[ChatGPT Helper]', ...args);
 
+  function setStatus(type, text, percent) {
+    lastStatus = { type, text, percent, ts: Date.now() };
+  }
 
   function progress(text, percent) {
     D('PROGRESS:', text, percent !== undefined ? `${percent}%` : '');
+    setStatus('progress', text, percent);
     try { chrome.runtime.sendMessage({ type: 'progress', text, percent }); } catch {}
   }
 
   function done(text) {
     D('DONE:', text);
+    running = false;
+    setStatus('done', text, 100);
     try { chrome.runtime.sendMessage({ type: 'done', text }); } catch {}
   }
 
   function error(text) {
     D('ERROR:', text);
+    running = false;
+    setStatus('error', text, undefined);
     try { chrome.runtime.sendMessage({ type: 'error', text }); } catch {}
+  }
+
+  function checkAbort() {
+    if (abortRequested) throw new Error('Cancelled by user');
   }
 
   async function getAuth() {
@@ -48,24 +66,51 @@ if (!window.__chatgptExportLoaded) {
   }
 
   async function api(path, auth) {
-    const fullUrl = `/backend-api${path}`;
-    D('API REQUEST:', fullUrl);
-    const res = await fetch(fullUrl, {
-      credentials: 'include',
-      headers: {
-        Authorization: `Bearer ${auth.token}`,
-        ...(auth.accountId ? { 'chatgpt-account-id': auth.accountId } : {}),
-      },
-    });
-    D('API RESPONSE:', fullUrl, '→ status:', res.status, res.statusText);
-    if (!res.ok) {
-      const body = await res.text();
-      D('API ERROR BODY:', body.slice(0, 500));
-      throw new Error(`${res.status} ${res.statusText} — ${path}`);
+    let attempt = 0;
+    while (true) {
+      attempt++;
+      checkAbort();
+      const fullUrl = `/backend-api${path}`;
+      D('API REQUEST:', fullUrl, attempt > 1 ? `(attempt ${attempt})` : '');
+      const res = await fetch(fullUrl, {
+        credentials: 'include',
+        headers: {
+          Authorization: `Bearer ${auth.token}`,
+          ...(auth.accountId ? { 'chatgpt-account-id': auth.accountId } : {}),
+        },
+      });
+      D('API RESPONSE:', fullUrl, '→ status:', res.status, res.statusText);
+
+      if (res.status === 429) {
+        delayMs = Math.min(delayMs * 2, DELAY_MAX);
+        const retryAfter = parseInt(res.headers.get('Retry-After')) || Math.ceil(delayMs / 1000);
+        // Escalating cooldowns: 0 → 60s → 2min → 5min
+        const cooldown = attempt >= 15 ? 300000 : attempt >= 10 ? 120000 : attempt >= 5 ? 60000 : 0;
+        const waitMs = Math.max(retryAfter * 1000, delayMs) + cooldown;
+        const waitSec = Math.round(waitMs / 1000);
+        const waitMin = waitSec >= 60 ? `${(waitSec / 60).toFixed(1)}min` : `${waitSec}s`;
+        D('API 429: waiting', waitMs, 'ms, delayMs =', delayMs, ', cooldown =', cooldown, ', attempt =', attempt);
+        progress(`Rate limited — waiting ${waitMin}… (attempt ${attempt})`);
+        await sleep(waitMs);
+        continue;
+      }
+
+      if (!res.ok) {
+        const body = await res.text();
+        D('API ERROR BODY:', body.slice(0, 500));
+        throw new Error(`${res.status} ${res.statusText} — ${path}`);
+      }
+
+      // Success — gradually recover speed
+      if (delayMs > DELAY_INITIAL) {
+        delayMs = Math.max(DELAY_INITIAL, Math.round(delayMs * 0.75));
+        D('API success: delay recovering to', delayMs, 'ms');
+      }
+
+      const data = await res.json();
+      D('API RESPONSE DATA keys:', Object.keys(data), ', total:', data.total, ', items:', data.items?.length);
+      return data;
     }
-    const data = await res.json();
-    D('API RESPONSE DATA keys:', Object.keys(data), ', total:', data.total, ', items:', data.items?.length);
-    return data;
   }
 
   async function listConversations(archived, auth, maxItems = 0) {
@@ -76,6 +121,7 @@ if (!window.__chatgptExportLoaded) {
     const pageSize = maxItems > 0 ? Math.min(LIMIT, maxItems) : LIMIT;
     D('listConversations: pageSize =', pageSize);
     while (total === null || offset < total) {
+      checkAbort();
       const url = `/conversations?offset=${offset}&limit=${pageSize}&order=updated&is_archived=${archived}&is_starred=false`;
       D('listConversations: fetching url =', url);
       const data = await api(url, auth);
@@ -92,7 +138,7 @@ if (!window.__chatgptExportLoaded) {
         D('listConversations: early stop — have', items.length, '>= maxItems', maxItems);
         break;
       }
-      if (offset < total) await sleep(DELAY_MS);
+      if (offset < total) await sleep(delayMs);
     }
     const result = maxItems > 0 ? items.slice(0, maxItems) : items;
     D('listConversations: returning', result.length, 'items');
@@ -213,18 +259,63 @@ if (!window.__chatgptExportLoaded) {
   async function fetchAttachment(url, auth) {
     D('fetchAttachment:', url);
     try {
-      const res = await fetch(url.startsWith('http') ? url : `https://chatgpt.com${url}`, {
-        credentials: 'include',
-        headers: { Authorization: `Bearer ${auth.token}` },
-      });
-      D('fetchAttachment: status =', res.status);
-      if (!res.ok) return null;
-      const blob = await res.blob();
-      return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.readAsDataURL(blob);
-      });
+      let resolvedUrl = url;
+
+      // file-service:// URLs need two-step resolution
+      if (url && url.startsWith('file-service://')) {
+        const fileId = url.replace('file-service://', '');
+        D('fetchAttachment: resolving file-service URL, fileId =', fileId);
+        const meta = await api(`/files/download/${fileId}?post_id=&inline=false`, auth);
+        if (!meta.download_url) {
+          D('fetchAttachment: no download_url in response:', JSON.stringify(meta));
+          return null;
+        }
+        resolvedUrl = meta.download_url;
+        D('fetchAttachment: resolved to', resolvedUrl);
+      }
+
+      if (!resolvedUrl) return null;
+
+      let attempt = 0;
+      while (true) {
+        attempt++;
+        const fetchUrl = resolvedUrl.startsWith('http') ? resolvedUrl : `https://chatgpt.com${resolvedUrl}`;
+        D('fetchAttachment: fetching', fetchUrl, attempt > 1 ? `(attempt ${attempt})` : '');
+        const res = await fetch(fetchUrl, {
+          credentials: 'include',
+          headers: { Authorization: `Bearer ${auth.token}` },
+        });
+        D('fetchAttachment: status =', res.status);
+
+        if (res.status === 429) {
+          delayMs = Math.min(delayMs * 2, DELAY_MAX);
+          const retryAfter = parseInt(res.headers.get('Retry-After')) || Math.ceil(delayMs / 1000);
+          const cooldown = attempt >= 15 ? 300000 : attempt >= 10 ? 120000 : attempt >= 5 ? 60000 : 0;
+          const waitMs = Math.max(retryAfter * 1000, delayMs) + cooldown;
+          const waitSec = Math.round(waitMs / 1000);
+          const waitMin = waitSec >= 60 ? `${(waitSec / 60).toFixed(1)}min` : `${waitSec}s`;
+          D('fetchAttachment 429: waiting', waitMs, 'ms, attempt =', attempt);
+          progress(`Rate limited on attachment — waiting ${waitMin}… (attempt ${attempt})`);
+          await sleep(waitMs);
+          continue;
+        }
+
+        if (!res.ok) {
+          D('fetchAttachment: failed with', res.status);
+          return null;
+        }
+
+        if (delayMs > DELAY_INITIAL) {
+          delayMs = Math.max(DELAY_INITIAL, Math.round(delayMs * 0.75));
+        }
+
+        const blob = await res.blob();
+        return new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.readAsDataURL(blob);
+        });
+      }
     } catch (e) {
       D('fetchAttachment: error =', e.message);
       return null;
@@ -245,20 +336,19 @@ if (!window.__chatgptExportLoaded) {
       let all = [];
 
       if (isProjectFilter) {
-        // Project conversations must be fetched through gizmo-specific endpoint
         D('runExport: fetching project conversations for', options.project);
         progress('Listing project conversations…', 5);
         const projectConvs = await listProjectConversations(options.project, auth);
         all.push(...projectConvs.map((c) => ({ ...c, _source: 'active' })));
         D('runExport: project conversations count =', all.length);
       } else {
-        // Regular conversations (inbox or all)
         const hasClientFilters = options.keyword || options.dateFrom || options.dateTo
           || options.project === 'inbox';
         const earlyLimit = (!hasClientFilters && options.limit > 0) ? options.limit : 0;
         D('runExport: hasClientFilters =', hasClientFilters, ', earlyLimit =', earlyLimit);
 
         if (options.source === 'active' || options.source === 'both') {
+          checkAbort();
           D('runExport: listing ACTIVE conversations, earlyLimit =', earlyLimit);
           progress('Listing active conversations…', 5);
           const active = await listConversations(false, auth, earlyLimit);
@@ -269,9 +359,10 @@ if (!window.__chatgptExportLoaded) {
           if (earlyLimit > 0 && all.length >= earlyLimit) {
             D('runExport: skipping archived — earlyLimit already satisfied');
           } else {
+            checkAbort();
             D('runExport: listing ARCHIVED conversations');
             progress('Listing archived conversations…', 10);
-            await sleep(DELAY_MS);
+            await sleep(delayMs);
             const remaining = earlyLimit > 0 ? earlyLimit - all.length : 0;
             const archived = await listConversations(true, auth, remaining);
             D('runExport: archived result count =', archived.length);
@@ -304,6 +395,7 @@ if (!window.__chatgptExportLoaded) {
       const attachmentMap = {};
 
       for (let i = 0; i < filtered.length; i++) {
+        checkAbort();
         const c = filtered[i];
         const pct = 15 + Math.round((i / filtered.length) * 75);
         progress(`[${i + 1}/${filtered.length}] ${c.title || 'untitled'}`, pct);
@@ -320,24 +412,28 @@ if (!window.__chatgptExportLoaded) {
               D('runExport: fetching', files.length, 'attachments for', c.id);
               const fetched = [];
               for (const f of files) {
+                checkAbort();
                 if (f.url) {
                   const dataUrl = await fetchAttachment(f.url, auth);
                   fetched.push({ ...f, data: dataUrl });
                 } else {
                   fetched.push(f);
                 }
+                await sleep(delayMs);
               }
               attachmentMap[c.id] = fetched;
             }
           }
         } catch (e) {
+          if (e.message === 'Cancelled by user') throw e;
           D('runExport: ERROR fetching conversation', c.id, ':', e.message);
           errors.push({ id: c.id, title: c.title, error: e.message });
         }
 
-        if (i < filtered.length - 1) await sleep(DELAY_MS);
+        if (i < filtered.length - 1) await sleep(delayMs);
       }
 
+      checkAbort();
       progress('Building export…', 92);
       const exportData = {
         exported_at: new Date().toISOString(),
@@ -418,32 +514,29 @@ if (!window.__chatgptExportLoaded) {
 
   async function listProjectConversations(gizmoId, auth) {
     D('listProjectConversations: gizmoId =', gizmoId);
-    // The /conversations endpoint ignores gizmo_id and returns gizmo_id=null.
-    // Project conversations must be fetched through the gizmo sidebar or a gizmo-specific endpoint.
-    // Try the gizmo conversations endpoint first, fall back to sidebar with high limit.
 
-    // Approach 1: Try /gizmos/{id}/conversations (undocumented)
     try {
       D('listProjectConversations: trying /gizmos endpoint...');
       let offset = 0;
       let total = null;
       const items = [];
       while (total === null || offset < total) {
+        checkAbort();
         const url = `/gizmos/${gizmoId}/conversations?offset=${offset}&limit=${LIMIT}`;
         const data = await api(url, auth);
         total = data.total;
         items.push(...(data.items || data.conversations || []));
         D('listProjectConversations: page — total:', total, ', accumulated:', items.length);
         offset += LIMIT;
-        if (offset < total) await sleep(DELAY_MS);
+        if (offset < total) await sleep(delayMs);
       }
       D('listProjectConversations: gizmo endpoint returned', items.length, 'conversations');
       if (items.length > 0) return items;
     } catch (e) {
+      if (e.message === 'Cancelled by user') throw e;
       D('listProjectConversations: gizmo endpoint failed:', e.message);
     }
 
-    // Approach 2: Sidebar with high conversations_per_gizmo
     D('listProjectConversations: falling back to sidebar approach...');
     const sidebarData = await api(
       `/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=200&limit=50`,
@@ -461,105 +554,113 @@ if (!window.__chatgptExportLoaded) {
     return convs;
   }
 
-  // --- Archive / Unarchive ---
-  let pendingConfirmResolve = null;
-
-  async function setArchived(conversationId, archived, auth) {
-    D('setArchived:', conversationId, '→ is_archived:', archived);
-    const res = await fetch(`/backend-api/conversation/${conversationId}`, {
-      method: 'PATCH',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${auth.token}`,
-        ...(auth.accountId ? { 'chatgpt-account-id': auth.accountId } : {}),
-      },
-      body: JSON.stringify({ is_archived: archived }),
-    });
-    D('setArchived: response status =', res.status);
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    return res.json();
-  }
-
-  async function runArchiveAction(options, archive) {
-    const verb = archive ? 'Archive' : 'Unarchive';
-    D('========== runArchiveAction START ==========');
-    D('runArchiveAction: verb =', verb, ', options =', JSON.stringify(options, null, 2));
+  async function runExportMemories(options) {
+    D('========== runExportMemories START ==========');
     try {
       progress('Authenticating…', 0);
       const auth = await getAuth();
 
-      const isArchived = !archive;
-      const isProjectFilter = options.project && options.project !== 'all' && options.project !== 'inbox';
-      D('runArchiveAction: isArchived =', isArchived, ', isProjectFilter =', isProjectFilter);
+      const didCookie = document.cookie.split(';').map((c) => c.trim()).find((c) => c.startsWith('oai-did='));
+      const deviceId = didCookie ? didCookie.split('=')[1] : null;
+      D('runExportMemories: deviceId =', deviceId);
 
-      let tagged;
-      if (isProjectFilter) {
-        progress('Listing project conversations…', 5);
-        const projectConvs = await listProjectConversations(options.project, auth);
-        tagged = projectConvs.map((c) => ({ ...c, _source: 'active' }));
-      } else {
-        progress(`Listing ${archive ? 'active' : 'archived'} conversations…`, 5);
-        const all = await listConversations(isArchived, auth);
-        tagged = all.map((c) => ({ ...c, _source: isArchived ? 'archived' : 'active' }));
-      }
-      D('runArchiveAction: listed', tagged.length, 'conversations');
-
-      const filtered = filterConversations(tagged, options);
-      progress(`Found ${filtered.length} conversations to ${verb.toLowerCase()}`, 15);
-
-      if (filtered.length === 0) {
-        done(`No conversations match your filters.`);
-        return;
-      }
-
-      try {
-        chrome.runtime.sendMessage({
-          type: 'confirm',
-          text: `${verb} ${filtered.length} conversation${filtered.length > 1 ? 's' : ''}?`,
-        });
-      } catch {}
-
-      const confirmed = await new Promise((resolve) => {
-        pendingConfirmResolve = resolve;
+      checkAbort();
+      progress('Fetching memories…', 20);
+      const res = await fetch('/backend-api/memories?exclusive_to_gizmo=false&include_memory_entries=true', {
+        credentials: 'include',
+        headers: {
+          Authorization: `Bearer ${auth.token}`,
+          ...(auth.accountId ? { 'chatgpt-account-id': auth.accountId } : {}),
+          ...(deviceId ? { 'oai-device-id': deviceId } : {}),
+          'oai-language': 'en-US',
+        },
       });
-      pendingConfirmResolve = null;
 
-      if (!confirmed) {
-        D('runArchiveAction: cancelled by user');
+      D('runExportMemories: status =', res.status);
+      if (!res.ok) {
+        const body = await res.text();
+        D('runExportMemories: error body =', body.slice(0, 500));
+        throw new Error(`${res.status} ${res.statusText} — /backend-api/memories`);
+      }
+
+      const data = await res.json();
+      D('runExportMemories: response keys =', Object.keys(data));
+      D('runExportMemories: raw =', JSON.stringify(data).slice(0, 1000));
+
+      let memories = [];
+      if (Array.isArray(data.memories)) {
+        memories = data.memories;
+      } else if (Array.isArray(data.memory_entries)) {
+        memories = data.memory_entries;
+      } else if (data.memory_tool_config?.memory_entries) {
+        memories = data.memory_tool_config.memory_entries;
+      } else {
+        D('runExportMemories: unknown response shape — full data:', JSON.stringify(data));
+      }
+
+      D('runExportMemories: extracted', memories.length, 'memories');
+      progress(`Found ${memories.length} memories`, 60);
+
+      if (memories.length === 0) {
+        done('No memories found.');
         return;
       }
 
-      let successCount = 0;
-      const errors = [];
-      for (let i = 0; i < filtered.length; i++) {
-        const c = filtered[i];
-        const pct = 15 + Math.round((i / filtered.length) * 80);
-        progress(`[${i + 1}/${filtered.length}] ${c.title || 'untitled'}`, pct);
-        try {
-          await setArchived(c.id, archive, auth);
-          successCount++;
-        } catch (e) {
-          D('runArchiveAction: error on', c.id, ':', e.message);
-          errors.push({ id: c.id, title: c.title, error: e.message });
-        }
-        if (i < filtered.length - 1) await sleep(DELAY_MS);
-      }
+      checkAbort();
+      const exportData = {
+        exported_at: new Date().toISOString(),
+        account: auth.accountId || 'unknown',
+        count: memories.length,
+        memories,
+      };
 
-      done(
-        `${verb}d ${successCount} conversations` +
-          (errors.length ? `, ${errors.length} errors` : '')
-      );
-      D('========== runArchiveAction END ==========');
+      const fmt = options.format || 'json';
+      const datestamp = new Date().toISOString().slice(0, 10);
+      const formats = {
+        json:     { ext: 'json', mime: 'application/json',  fn: () => JSON.stringify(exportData, null, 2) },
+        markdown: { ext: 'md',   mime: 'text/markdown',     fn: () => memoriesToMarkdown(exportData) },
+        txt:      { ext: 'txt',  mime: 'text/plain',        fn: () => memoriesToText(exportData) },
+      };
+
+      const { ext, mime, fn } = formats[fmt] || formats.json;
+      progress(`Generating ${ext.toUpperCase()}…`, 90);
+      const content = fn();
+
+      progress('Downloading…', 99);
+      const blob = new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `chatgpt-memories-${datestamp}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      done(`Exported ${memories.length} memories as ${ext.toUpperCase()}`);
+      D('========== runExportMemories END ==========');
     } catch (e) {
-      D('runArchiveAction: FATAL ERROR:', e.message, e.stack);
+      D('runExportMemories: FATAL ERROR:', e.message, e.stack);
       error(e.message);
     }
   }
 
   // Listen for messages from popup
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    D('MESSAGE RECEIVED:', msg.action, msg.action === 'export' || msg.action === 'archive' || msg.action === 'unarchive' ? JSON.stringify(msg.options) : '');
+    D('MESSAGE RECEIVED:', msg.action);
+
+    if (msg.action === 'get-status') {
+      sendResponse({ running, lastStatus });
+      return;
+    }
+
+    if (msg.action === 'abort') {
+      D('Abort requested');
+      abortRequested = true;
+      sendResponse({ ok: true });
+      return;
+    }
+
     if (msg.action === 'list-projects') {
       listProjects()
         .then((projects) => sendResponse({ projects }))
@@ -569,21 +670,29 @@ if (!window.__chatgptExportLoaded) {
         });
       return true;
     }
+
     if (msg.action === 'export') {
+      if (running) {
+        sendResponse({ ok: false, reason: 'Export already in progress' });
+        return;
+      }
+      running = true;
+      abortRequested = false;
+      delayMs = DELAY_INITIAL;
       runExport(msg.options);
       sendResponse({ ok: true });
     }
-    if (msg.action === 'archive') {
-      runArchiveAction(msg.options, true);
+
+    if (msg.action === 'exportMemories') {
+      if (running) {
+        sendResponse({ ok: false, reason: 'Export already in progress' });
+        return;
+      }
+      running = true;
+      abortRequested = false;
+      delayMs = DELAY_INITIAL;
+      runExportMemories(msg.options);
       sendResponse({ ok: true });
-    }
-    if (msg.action === 'unarchive') {
-      runArchiveAction(msg.options, false);
-      sendResponse({ ok: true });
-    }
-    if (msg.action === 'confirm-response') {
-      D('confirm-response:', msg.confirmed);
-      if (pendingConfirmResolve) pendingConfirmResolve(msg.confirmed);
     }
   });
 }

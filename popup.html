@@ -177,57 +177,55 @@
   <!-- Tabs -->
   <div class="tabs">
     <div class="tab active" data-tab="export">Export</div>
-    <div class="tab" data-tab="archive">Archive</div>
-    <div class="tab" data-tab="unarchive">Unarchive</div>
+    <div class="tab" data-tab="memories">Memories</div>
   </div>
 
-  <!-- Shared filters -->
-  <div class="field" id="source-field">
-    <label>Source</label>
-    <select id="source">
-      <option value="active">Active</option>
-      <option value="archived">Archived</option>
-      <option value="both" selected>Both</option>
-    </select>
-  </div>
-
-  <div class="field" id="project-field">
-    <label>Project</label>
-    <select id="project">
-      <option value="all">All conversations</option>
-      <option value="inbox">Inbox (no project)</option>
-    </select>
-    <div id="project-loading" class="hint">Loading projects…</div>
-  </div>
-
-  <div class="row">
-    <div class="field">
-      <label>From</label>
-      <input type="date" id="date-from">
+  <!-- Shared filters (Export only) -->
+  <div id="export-filters">
+    <div class="field" id="source-field">
+      <label>Source</label>
+      <select id="source">
+        <option value="active">Active</option>
+        <option value="archived">Archived</option>
+        <option value="both" selected>Both</option>
+      </select>
     </div>
-    <div class="field">
-      <label>To</label>
-      <input type="date" id="date-to">
+
+    <div class="field" id="project-field">
+      <label>Project</label>
+      <select id="project">
+        <option value="all">All conversations</option>
+        <option value="inbox">Inbox (no project)</option>
+      </select>
+      <div id="project-loading" class="hint">Loading projects…</div>
     </div>
-  </div>
 
-  <div class="field">
-    <label>Keyword</label>
-    <input type="text" id="keyword" placeholder="Filter by title">
-  </div>
+    <div class="row">
+      <div class="field">
+        <label>From</label>
+        <input type="date" id="date-from">
+      </div>
+      <div class="field">
+        <label>To</label>
+        <input type="date" id="date-to">
+      </div>
+    </div>
 
-  <div class="checkbox-field">
-    <input type="checkbox" id="export-all" checked>
-    <label for="export-all">All matching conversations</label>
-  </div>
+    <div class="field">
+      <label>Keyword</label>
+      <input type="text" id="keyword" placeholder="Filter by title">
+    </div>
 
-  <div class="field hidden" id="limit-field">
-    <label>Max conversations</label>
-    <input type="number" id="limit" value="10" min="1">
-  </div>
+    <div class="checkbox-field">
+      <input type="checkbox" id="export-all" checked>
+      <label for="export-all">All matching conversations</label>
+    </div>
 
-  <!-- Export-only options -->
-  <div id="export-options">
+    <div class="field hidden" id="limit-field">
+      <label>Max conversations</label>
+      <input type="number" id="limit" value="10" min="1">
+    </div>
+
     <div class="field">
       <label>Format</label>
       <select id="format">
@@ -246,11 +244,23 @@
     </div>
   </div>
 
+  <!-- Memories options -->
+  <div id="memories-options" class="hidden">
+    <div class="field">
+      <label>Format</label>
+      <select id="memories-format">
+        <option value="json">JSON — full data</option>
+        <option value="markdown">Markdown</option>
+        <option value="txt">Plain text</option>
+      </select>
+    </div>
+  </div>
+
   <!-- Action buttons -->
   <div class="actions">
-    <button id="export-btn" class="btn-primary">Export</button>
-    <button id="archive-btn" class="btn-warning hidden">Archive matching</button>
-    <button id="unarchive-btn" class="btn-success hidden">Unarchive matching</button>
+    <button id="export-btn" class="btn-primary">Export Conversations</button>
+    <button id="memories-btn" class="btn-primary hidden">Export Memories</button>
+    <button id="cancel-btn" class="btn-warning hidden" style="margin-top: 6px;">Cancel</button>
   </div>
 
   <div id="progress"></div>

@@ -5,22 +5,19 @@
 [![Chrome](https://img.shields.io/badge/Chrome-Extension-4285F4?style=flat&logo=googlechrome&logoColor=white)](https://github.com/D1DX/chatgpt-helper)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat)](./LICENSE)
 
-Chrome extension for managing ChatGPT conversations. Export in 6 formats, bulk archive, and bulk unarchive — all with filters.
+Chrome extension for exporting ChatGPT conversations and memories. Export in 6 formats with filters, attachments, and adaptive rate limiting.
 
 ## What It Does
 
 | Action | Description |
 | ------ | ----------- |
-| **Export** | Download conversations as JSON, Markdown, JSONL, HTML, CSV, or plain text |
-| **Archive** | Bulk archive active conversations matching your filters |
-| **Unarchive** | Bulk unarchive conversations by date, keyword, or project |
-
-All actions share the same filter panel: project, source, date range, keyword, and item limit.
+| **Export Conversations** | Download conversations as JSON, Markdown, JSONL, HTML, CSV, or plain text |
+| **Export Memories** | Download all ChatGPT memories as JSON, Markdown, or plain text |
 
 ## How It Works
 
 1. Authenticates using your active ChatGPT browser session
-2. Calls ChatGPT's internal API to list, fetch, archive, or unarchive conversations
+2. Calls ChatGPT's internal API to list and fetch conversations or memories
 3. Applies your filters client-side
 4. No data leaves your browser. No external servers. No telemetry.
 
@@ -39,8 +36,17 @@ git clone https://github.com/D1DX/chatgpt-helper.git
 
 1. Open [chatgpt.com](https://chatgpt.com) and log in
 2. Click the extension icon
-3. Choose a tab: **Export**, **Archive**, or **Unarchive**
-4. Set filters and click the action button
+3. Choose a tab: **Export** (conversations) or **Memories**
+4. Set filters/format and click the action button
+
+### Long exports
+
+For large accounts (1000+ conversations), the export can take hours due to API rate limits. To run overnight:
+
+1. Run `caffeinate -d -i -s` in Terminal (prevents Mac sleep)
+2. Leave Chrome open with the chatgpt.com tab visible (not minimized)
+3. Start the export and close the popup — it runs in the background
+4. Reopen the popup anytime to check progress or cancel
 
 ## Export Formats
 
@@ -53,15 +59,17 @@ git clone https://github.com/D1DX/chatgpt-helper.git
 | CSV | `.csv` | Spreadsheet analysis |
 | Plain text | `.txt` | Grep-friendly, simplest |
 
+Memories export supports JSON, Markdown, and plain text.
+
 ## Filters
 
 | Filter | Scope | Notes |
 | ------ | ----- | ----- |
-| Project | Active only | Select a ChatGPT project or inbox |
-| Source | Export only | Active, archived, or both |
-| Date range | All actions | Filter by conversation creation date |
-| Keyword | All actions | Matches conversation title |
-| Limit | All actions | Cap the number of conversations processed |
+| Project | Conversations | Select a ChatGPT project or inbox |
+| Source | Conversations | Active, archived, or both |
+| Date range | Conversations | Filter by conversation creation date |
+| Keyword | Conversations | Matches conversation title |
+| Limit | Conversations | Cap the number of conversations processed |
 | Attachments | JSON export only | Include uploaded files and generated images |
 
 ## Permissions

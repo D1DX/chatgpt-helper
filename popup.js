@@ -22,26 +22,18 @@ document.querySelectorAll('.tab').forEach((tab) => {
 });
 
 function updateUI() {
-  // Source field: hide for unarchive (always archived), show for others
-  $('source-field').classList.toggle('hidden', currentTab === 'unarchive');
-  if (currentTab === 'unarchive') $('source').value = 'archived';
-  if (currentTab === 'archive') $('source').value = 'active';
+  const isMemories = currentTab === 'memories';
 
-  // Project: only show when source is strictly "active"
-  const showProject = $('source').value === 'active' && currentTab !== 'unarchive';
-  $('project-field').classList.toggle('hidden', !showProject);
-  if (sourceIsArchived) $('project').value = 'all';
+  $('export-filters').classList.toggle('hidden', isMemories);
+  $('memories-options').classList.toggle('hidden', !isMemories);
+  $('export-btn').classList.toggle('hidden', isMemories);
+  $('memories-btn').classList.toggle('hidden', !isMemories);
 
-  // Export-only options
-  $('export-options').classList.toggle('hidden', currentTab !== 'export');
-
-  // Buttons
-  $('export-btn').classList.toggle('hidden', currentTab !== 'export');
-  $('archive-btn').classList.toggle('hidden', currentTab !== 'archive');
-  $('unarchive-btn').classList.toggle('hidden', currentTab !== 'unarchive');
-
-  // Attachments only for JSON
-  updateAttachmentsVisibility();
+  if (!isMemories) {
+    const sourceArchived = $('source').value === 'archived';
+    $('project-field').classList.toggle('hidden', sourceArchived);
+    updateAttachmentsVisibility();
+  }
 }
 
 $('source').addEventListener('change', updateUI);
@@ -57,7 +49,26 @@ $('export-all').addEventListener('change', () => {
   $('limit-field').classList.toggle('hidden', $('export-all').checked);
 });
 
-// --- Load projects on popup open ---
+// --- UI state for running/idle ---
+const ACTION_BTNS = ['export-btn', 'memories-btn'];
+
+function setRunningUI(isRunning) {
+  ACTION_BTNS.forEach((id) => { $(id).disabled = isRunning; });
+  $('cancel-btn').classList.toggle('hidden', !isRunning);
+}
+
+function applyStatus(status) {
+  if (!status) return;
+  $('progress').textContent = status.text || '';
+  $('progress').className = status.type === 'error' ? 'error' : '';
+  $('progress-bar-container').style.display = 'block';
+  if (status.percent !== undefined) {
+    $('progress-bar').style.width = status.percent + '%';
+  }
+  log(status.text);
+}
+
+// --- Load projects + check running status on popup open ---
 async function injectAndGetTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.url?.startsWith('https://chatgpt.com')) return null;
@@ -78,6 +89,20 @@ async function injectAndGetTab() {
       return;
     }
 
+    // Check if an export is already running
+    chrome.tabs.sendMessage(tab.id, { action: 'get-status' }, (response) => {
+      if (chrome.runtime.lastError || !response) return;
+      if (response.running) {
+        setRunningUI(true);
+        if (response.lastStatus) applyStatus(response.lastStatus);
+        log('Reconnected to running export');
+      } else if (response.lastStatus) {
+        // Show last result from a completed run
+        applyStatus(response.lastStatus);
+      }
+    });
+
+    // Load projects
     chrome.tabs.sendMessage(tab.id, { action: 'list-projects' }, (response) => {
       const el = $('project');
       const loading = $('project-loading');
@@ -102,7 +127,7 @@ async function injectAndGetTab() {
 function getOptions() {
   return {
     project: $('project').value,
-    source: currentTab === 'unarchive' ? 'archived' : currentTab === 'archive' ? 'active' : $('source').value,
+    source: $('source').value,
     dateFrom: $('date-from').value || null,
     dateTo: $('date-to').value || null,
     keyword: $('keyword').value.trim() || null,
@@ -114,9 +139,11 @@ function getOptions() {
 
 // --- Send action to content script ---
 async function sendAction(action) {
-  const options = getOptions();
-  const btns = ['export-btn', 'archive-btn', 'unarchive-btn'];
-  btns.forEach((id) => { $(id).disabled = true; });
+  const options = action === 'exportMemories'
+    ? { format: $('memories-format').value }
+    : getOptions();
+
+  setRunningUI(true);
   $('progress').textContent = 'Starting…';
   $('progress').className = '';
   $('progress-bar-container').style.display = 'block';
@@ -132,54 +159,58 @@ async function sendAction(action) {
       if (chrome.runtime.lastError) {
         $('progress').textContent = 'Failed to connect. Refresh chatgpt.com and retry.';
         $('progress').className = 'error';
-        btns.forEach((id) => { $(id).disabled = false; });
+        setRunningUI(false);
+        return;
+      }
+      if (response && !response.ok && response.reason) {
+        $('progress').textContent = response.reason;
+        $('progress').className = 'error';
+        log(response.reason);
+        setRunningUI(false);
       }
     });
   } catch (e) {
     $('progress').textContent = e.message;
     $('progress').className = 'error';
-    btns.forEach((id) => { $(id).disabled = false; });
+    setRunningUI(false);
   }
 }
 
 $('export-btn').addEventListener('click', () => sendAction('export'));
-$('archive-btn').addEventListener('click', () => sendAction('archive'));
-$('unarchive-btn').addEventListener('click', () => sendAction('unarchive'));
+$('memories-btn').addEventListener('click', () => sendAction('exportMemories'));
+
+// --- Cancel ---
+$('cancel-btn').addEventListener('click', async () => {
+  try {
+    const tab = await injectAndGetTab();
+    if (tab) {
+      chrome.tabs.sendMessage(tab.id, { action: 'abort' });
+    }
+  } catch {}
+  $('cancel-btn').classList.add('hidden');
+  log('Cancel requested');
+});
 
 // --- Listen for progress updates ---
 chrome.runtime.onMessage.addListener((msg) => {
-  const btns = ['export-btn', 'archive-btn', 'unarchive-btn'];
   if (msg.type === 'progress') {
     $('progress').textContent = msg.text;
     log(msg.text);
     if (msg.percent !== undefined) {
       $('progress-bar').style.width = msg.percent + '%';
     }
-  } else if (msg.type === 'confirm') {
-    // Archive/unarchive confirmation
-    const ok = confirm(msg.text);
-    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
-      chrome.tabs.sendMessage(tab.id, { action: 'confirm-response', confirmed: ok });
-    });
-    if (!ok) {
-      $('progress').textContent = 'Cancelled.';
-      log('Cancelled by user');
-      btns.forEach((id) => { $(id).disabled = false; });
-    }
   } else if (msg.type === 'done') {
     $('progress').textContent = msg.text;
     $('progress-bar').style.width = '100%';
     log(msg.text);
-    btns.forEach((id) => { $(id).disabled = false; });
+    setRunningUI(false);
   } else if (msg.type === 'error') {
     $('progress').textContent = msg.text;
     $('progress').className = 'error';
     log('ERROR: ' + msg.text);
-    btns.forEach((id) => { $(id).disabled = false; });
+    setRunningUI(false);
   }
 });
 
 // Init
 updateUI();
-
-

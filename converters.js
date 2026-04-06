@@ -129,6 +129,47 @@ function toCSV(exportData) {
   return rows.join('\n');
 }
 
+function memoriesToMarkdown(exportData) {
+  const lines = [];
+  lines.push(`# ChatGPT Memories`);
+  lines.push(`> Exported: ${exportData.exported_at}`);
+  lines.push(`> Count: ${exportData.count}`);
+  lines.push('');
+
+  exportData.memories.forEach((entry, i) => {
+    // Handle various possible field names for the text content
+    const text = entry.text || entry.content || entry.memory || (typeof entry === 'string' ? entry : JSON.stringify(entry));
+    const id = entry.id || entry.memory_id || null;
+    const created = entry.created_at || entry.create_time || entry.created || null;
+    const updated = entry.updated_at || entry.update_time || entry.updated || null;
+
+    const dateStr = created
+      ? new Date(typeof created === 'number' ? created * 1000 : created).toISOString().slice(0, 10)
+      : null;
+
+    lines.push(`${i + 1}. ${text}`);
+    const meta = [dateStr, id ? `id: ${id}` : null].filter(Boolean).join(' · ');
+    if (meta) lines.push(`   *${meta}*`);
+    lines.push('');
+  });
+
+  return lines.join('\n');
+}
+
+function memoriesToText(exportData) {
+  const lines = [];
+  lines.push(`ChatGPT Memories — exported ${exportData.exported_at.slice(0, 10)}`);
+  lines.push(`Total: ${exportData.count}`);
+  lines.push('');
+
+  exportData.memories.forEach((entry, i) => {
+    const text = entry.text || entry.content || entry.memory || (typeof entry === 'string' ? entry : JSON.stringify(entry));
+    lines.push(`${i + 1}. ${text}`);
+  });
+
+  return lines.join('\n');
+}
+
 function toHTML(exportData) {
   const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
