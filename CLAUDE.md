@@ -2,6 +2,37 @@
 
 Chrome extension for exporting ChatGPT conversations and memories using ChatGPT's unofficial internal API.
 
+## v3.1.0 — Checkpoint / Resume / Retry-by-ID
+
+Adds crash-safe progress persistence and selective recovery:
+
+- **Checkpoint to `chrome.storage.local`** — every successful fetch is written to storage immediately. Tab close, browser crash, or navigation no longer lose progress.
+- **Resume mode** — on "Export", if a checkpoint exists with matching filters, offer to resume from where the previous run stopped.
+- **Retry-by-ID mode** — accept a pasted list of conversation IDs (JSON array or newline-separated). Skips listing entirely, fetches only those IDs. Designed to recover 429-missed conversations from a previous run.
+- **Download partial** — build and download an export file from the current checkpoint without waiting for the run to finish.
+- **Pause vs Abort** — Pause stops the loop but keeps the checkpoint (resume later). Abort discards it.
+
+### Storage schema
+
+Single key `export_checkpoint` in `chrome.storage.local`:
+
+```javascript
+{
+  runId: string,             // timestamp of run start
+  mode: 'list' | 'retry',    // list = normal filter run, retry = by-id run
+  options: object,           // filter options for the run
+  startedAt: ISO string,
+  targetIds: string[],       // IDs we intend to fetch this run
+  fetched: { [id]: conv },   // successfully fetched, keyed by id
+  failed: [{id, title, error}], // non-429 errors
+  paused: boolean,
+  lastUpdate: ISO string,
+}
+```
+
+Only one checkpoint at a time — starting a new run with different filters prompts the user to discard or download the previous one first.
+
+
 ## Architecture
 
 ```

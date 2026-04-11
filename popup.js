@@ -23,13 +23,17 @@ document.querySelectorAll('.tab').forEach((tab) => {
 
 function updateUI() {
   const isMemories = currentTab === 'memories';
+  const isRetry = currentTab === 'retry';
+  const isExport = currentTab === 'export';
 
-  $('export-filters').classList.toggle('hidden', isMemories);
+  $('export-filters').classList.toggle('hidden', !isExport);
+  $('retry-panel').classList.toggle('hidden', !isRetry);
   $('memories-options').classList.toggle('hidden', !isMemories);
-  $('export-btn').classList.toggle('hidden', isMemories);
+  $('export-btn').classList.toggle('hidden', !isExport);
+  $('retry-btn').classList.toggle('hidden', !isRetry);
   $('memories-btn').classList.toggle('hidden', !isMemories);
 
-  if (!isMemories) {
+  if (isExport) {
     const sourceArchived = $('source').value === 'archived';
     $('project-field').classList.toggle('hidden', sourceArchived);
     updateAttachmentsVisibility();
@@ -50,11 +54,15 @@ $('export-all').addEventListener('change', () => {
 });
 
 // --- UI state for running/idle ---
-const ACTION_BTNS = ['export-btn', 'memories-btn'];
+const ACTION_BTNS = ['export-btn', 'retry-btn', 'memories-btn', 'cp-resume-btn', 'cp-download-btn', 'cp-discard-btn'];
 
 function setRunningUI(isRunning) {
-  ACTION_BTNS.forEach((id) => { $(id).disabled = isRunning; });
+  ACTION_BTNS.forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = isRunning;
+  });
   $('cancel-btn').classList.toggle('hidden', !isRunning);
+  $('pause-btn').classList.toggle('hidden', !isRunning);
 }
 
 function applyStatus(status) {
@@ -81,6 +89,40 @@ async function injectAndGetTab() {
   return tab;
 }
 
+// --- Checkpoint banner ---
+let currentCheckpoint = null; // cached from get-checkpoint
+
+function renderCheckpointBanner(cp) {
+  currentCheckpoint = cp;
+  const banner = $('checkpoint-banner');
+  if (!cp) {
+    banner.classList.remove('active');
+    return;
+  }
+  banner.classList.add('active');
+  const modeLabel = cp.mode === 'retry' ? 'Retry-by-ID run' : 'Export run';
+  $('cp-title').textContent = `${modeLabel}${cp.paused ? ' (paused)' : ''}`;
+  const when = cp.lastUpdate ? new Date(cp.lastUpdate).toLocaleString() : '';
+  $('cp-summary').innerHTML =
+    `<strong>${cp.fetched}</strong>/${cp.total} fetched` +
+    (cp.failed ? ` · ${cp.failed} failed` : '') +
+    `<br>Last update: ${when}`;
+}
+
+async function refreshCheckpointBanner(tab) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tab.id, { action: 'get-checkpoint' }, (response) => {
+      if (chrome.runtime.lastError || !response) {
+        renderCheckpointBanner(null);
+        resolve(null);
+        return;
+      }
+      renderCheckpointBanner(response.hasCheckpoint ? response.checkpoint : null);
+      resolve(response.hasCheckpoint ? response.checkpoint : null);
+    });
+  });
+}
+
 (async () => {
   try {
     const tab = await injectAndGetTab();
@@ -101,6 +143,9 @@ async function injectAndGetTab() {
         applyStatus(response.lastStatus);
       }
     });
+
+    // Check for existing checkpoint
+    await refreshCheckpointBanner(tab);
 
     // Load projects
     chrome.tabs.sendMessage(tab.id, { action: 'list-projects' }, (response) => {
@@ -138,10 +183,15 @@ function getOptions() {
 }
 
 // --- Send action to content script ---
-async function sendAction(action) {
-  const options = action === 'exportMemories'
-    ? { format: $('memories-format').value }
-    : getOptions();
+async function sendAction(action, optionsOverride) {
+  let options;
+  if (optionsOverride) {
+    options = optionsOverride;
+  } else if (action === 'exportMemories') {
+    options = { format: $('memories-format').value };
+  } else {
+    options = getOptions();
+  }
 
   setRunningUI(true);
   $('progress').textContent = 'Starting…';
@@ -176,19 +226,151 @@ async function sendAction(action) {
   }
 }
 
-$('export-btn').addEventListener('click', () => sendAction('export'));
+// --- Retry-by-ID parsing ---
+// Non-global for .test(), global for .match() — keep separate to avoid lastIndex bugs
+const UUID_TEST = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_FIND = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+function parseRetryIds(text) {
+  if (!text) return [];
+  const trimmed = text.trim();
+  // Try JSON array first
+  if (trimmed.startsWith('[')) {
+    try {
+      const arr = JSON.parse(trimmed);
+      if (Array.isArray(arr)) {
+        const ids = arr
+          .map((x) => (typeof x === 'string' ? x : x && x.id))
+          .filter((x) => typeof x === 'string' && UUID_TEST.test(x))
+          .map((s) => s.toLowerCase());
+        return [...new Set(ids)];
+      }
+    } catch {}
+  }
+  // Fallback: extract UUIDs from any text (lines, commas, whitespace)
+  const matches = trimmed.match(UUID_FIND) || [];
+  return [...new Set(matches.map((s) => s.toLowerCase()))];
+}
+
+$('retry-ids').addEventListener('input', () => {
+  const ids = parseRetryIds($('retry-ids').value);
+  $('retry-ids-count').textContent = `${ids.length} IDs parsed`;
+});
+
+$('export-btn').addEventListener('click', async () => {
+  // Re-read live checkpoint from storage — cached value may be stale after pause/done
+  const tab = await injectAndGetTab();
+  if (!tab) { sendAction('export'); return; }
+  const cp = await refreshCheckpointBanner(tab);
+  if (cp) {
+    const msg = `A previous run has ${cp.fetched}/${cp.total} fetched.\n\n` +
+      `OK = discard it and start fresh.\nCancel = use the Resume button in the banner instead.`;
+    if (!confirm(msg)) return;
+    chrome.tabs.sendMessage(tab.id, { action: 'clear-checkpoint' }, () => {
+      if (chrome.runtime.lastError) {
+        $('progress').textContent = 'Failed to clear checkpoint';
+        $('progress').className = 'error';
+        return;
+      }
+      renderCheckpointBanner(null);
+      sendAction('export');
+    });
+    return;
+  }
+  sendAction('export');
+});
 $('memories-btn').addEventListener('click', () => sendAction('exportMemories'));
 
-// --- Cancel ---
-$('cancel-btn').addEventListener('click', async () => {
+$('retry-btn').addEventListener('click', async () => {
+  const ids = parseRetryIds($('retry-ids').value);
+  if (ids.length === 0) {
+    $('progress').textContent = 'No valid conversation IDs found.';
+    $('progress').className = 'error';
+    return;
+  }
+  const options = {
+    _retryIds: ids,
+    format: $('retry-format').value,
+    attachments: $('retry-attachments').checked && $('retry-format').value === 'json',
+  };
+  const tab = await injectAndGetTab();
+  if (!tab) { sendAction('export', options); return; }
+  const cp = await refreshCheckpointBanner(tab);
+  if (cp) {
+    const msg = `A previous run has ${cp.fetched}/${cp.total} fetched.\n\n` +
+      `OK = discard it and start this retry run.\nCancel = keep previous checkpoint.`;
+    if (!confirm(msg)) return;
+    chrome.tabs.sendMessage(tab.id, { action: 'clear-checkpoint' }, () => {
+      if (chrome.runtime.lastError) {
+        $('progress').textContent = 'Failed to clear checkpoint';
+        $('progress').className = 'error';
+        return;
+      }
+      renderCheckpointBanner(null);
+      sendAction('export', options);
+    });
+    return;
+  }
+  sendAction('export', options);
+});
+
+// --- Pause (keep checkpoint) ---
+$('pause-btn').addEventListener('click', async () => {
   try {
     const tab = await injectAndGetTab();
-    if (tab) {
-      chrome.tabs.sendMessage(tab.id, { action: 'abort' });
-    }
+    if (tab) chrome.tabs.sendMessage(tab.id, { action: 'pause' });
+  } catch {}
+  log('Pause requested — checkpoint will be preserved');
+});
+
+// --- Cancel (discard checkpoint) ---
+$('cancel-btn').addEventListener('click', async () => {
+  if (!confirm('Cancel and discard all progress? Use Pause to keep progress instead.')) return;
+  try {
+    const tab = await injectAndGetTab();
+    if (tab) chrome.tabs.sendMessage(tab.id, { action: 'abort' });
   } catch {}
   $('cancel-btn').classList.add('hidden');
-  log('Cancel requested');
+  $('pause-btn').classList.add('hidden');
+  renderCheckpointBanner(null);
+  log('Cancel requested — progress discarded');
+});
+
+// --- Checkpoint banner actions ---
+$('cp-resume-btn').addEventListener('click', async () => {
+  if (!currentCheckpoint) return;
+  // Resume uses the SAME options from the checkpoint + _resume flag
+  const opts = { ...currentCheckpoint.options, _resume: true };
+  sendAction('export', opts);
+});
+
+$('cp-download-btn').addEventListener('click', async () => {
+  try {
+    const tab = await injectAndGetTab();
+    if (!tab) return;
+    chrome.tabs.sendMessage(tab.id, { action: 'download-partial' }, (response) => {
+      if (response && !response.ok) {
+        $('progress').textContent = response.reason || 'Download failed';
+        $('progress').className = 'error';
+      }
+    });
+  } catch (e) {
+    log('Download partial failed: ' + e.message);
+  }
+});
+
+$('cp-discard-btn').addEventListener('click', async () => {
+  if (!confirm('Discard the checkpoint? This cannot be undone.')) return;
+  try {
+    const tab = await injectAndGetTab();
+    if (!tab) return;
+    chrome.tabs.sendMessage(tab.id, { action: 'clear-checkpoint' }, () => {
+      renderCheckpointBanner(null);
+      log('Checkpoint discarded');
+    });
+  } catch (e) {
+    log('Discard failed: ' + e.message);
+  }
 });
 
 // --- Listen for progress updates ---
@@ -204,11 +386,15 @@ chrome.runtime.onMessage.addListener((msg) => {
     $('progress-bar').style.width = '100%';
     log(msg.text);
     setRunningUI(false);
+    // Refresh banner — checkpoint is cleared on success
+    injectAndGetTab().then((tab) => tab && refreshCheckpointBanner(tab)).catch(() => {});
   } else if (msg.type === 'error') {
     $('progress').textContent = msg.text;
     $('progress').className = 'error';
     log('ERROR: ' + msg.text);
     setRunningUI(false);
+    // Refresh banner — may now reflect pause state or preserved checkpoint
+    injectAndGetTab().then((tab) => tab && refreshCheckpointBanner(tab)).catch(() => {});
   }
 });
 

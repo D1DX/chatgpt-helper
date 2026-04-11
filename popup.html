@@ -104,6 +104,52 @@
     .btn-warning:hover:not(:disabled) { background: #d35400; }
     .btn-success { background: #0FB5A9; }
     .btn-success:hover:not(:disabled) { background: #0a8f86; }
+    .btn-secondary { background: #7f8c8d; }
+    .btn-secondary:hover:not(:disabled) { background: #5d6d7e; }
+    .btn-danger { background: #c0392b; }
+    .btn-danger:hover:not(:disabled) { background: #922b21; }
+
+    /* Checkpoint banner */
+    #checkpoint-banner {
+      display: none;
+      margin-bottom: 12px;
+      padding: 8px 10px;
+      background: #fff8e1;
+      border: 1px solid #ffcc80;
+      border-radius: 4px;
+      font-size: 11px;
+      line-height: 1.5;
+      color: #5d4037;
+    }
+    #checkpoint-banner.active { display: block; }
+    #checkpoint-banner .cp-title {
+      font-weight: 600;
+      color: #e67e22;
+      margin-bottom: 4px;
+    }
+    #checkpoint-banner .cp-actions {
+      display: flex;
+      gap: 4px;
+      margin-top: 6px;
+    }
+    #checkpoint-banner .cp-actions button {
+      padding: 5px 6px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+
+    /* Retry-by-ID textarea */
+    textarea {
+      width: 100%;
+      padding: 6px 8px;
+      font-size: 11px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      background: #fff;
+      font-family: 'SF Mono', Menlo, monospace;
+      resize: vertical;
+      min-height: 60px;
+    }
 
     /* Progress */
     #progress {
@@ -174,9 +220,21 @@
 <body>
   <h1>ChatGPT Helper <span class="badge">D1DX</span></h1>
 
+  <!-- Checkpoint banner (resumable run) -->
+  <div id="checkpoint-banner">
+    <div class="cp-title" id="cp-title">Checkpoint found</div>
+    <div id="cp-summary"></div>
+    <div class="cp-actions">
+      <button id="cp-resume-btn" class="btn-success">Resume</button>
+      <button id="cp-download-btn" class="btn-secondary">Download partial</button>
+      <button id="cp-discard-btn" class="btn-danger">Discard</button>
+    </div>
+  </div>
+
   <!-- Tabs -->
   <div class="tabs">
     <div class="tab active" data-tab="export">Export</div>
+    <div class="tab" data-tab="retry">Retry IDs</div>
     <div class="tab" data-tab="memories">Memories</div>
   </div>
 
@@ -244,6 +302,30 @@
     </div>
   </div>
 
+  <!-- Retry-by-ID panel -->
+  <div id="retry-panel" class="hidden">
+    <div class="field">
+      <label>Conversation IDs to fetch</label>
+      <textarea id="retry-ids" placeholder='Paste JSON array or newline-separated UUIDs&#10;e.g.:&#10;aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee&#10;11111111-2222-3333-4444-555555555555'></textarea>
+      <div class="hint" id="retry-ids-count">0 IDs parsed</div>
+    </div>
+    <div class="field">
+      <label>Format</label>
+      <select id="retry-format">
+        <option value="json">JSON — full backup</option>
+        <option value="markdown">Markdown</option>
+        <option value="jsonl">JSONL</option>
+        <option value="html">HTML</option>
+        <option value="csv">CSV</option>
+        <option value="txt">Plain text</option>
+      </select>
+    </div>
+    <div class="checkbox-field">
+      <input type="checkbox" id="retry-attachments">
+      <label for="retry-attachments">Include attachments (JSON only)</label>
+    </div>
+  </div>
+
   <!-- Memories options -->
   <div id="memories-options" class="hidden">
     <div class="field">
@@ -259,8 +341,10 @@
   <!-- Action buttons -->
   <div class="actions">
     <button id="export-btn" class="btn-primary">Export Conversations</button>
+    <button id="retry-btn" class="btn-primary hidden">Fetch IDs</button>
     <button id="memories-btn" class="btn-primary hidden">Export Memories</button>
-    <button id="cancel-btn" class="btn-warning hidden" style="margin-top: 6px;">Cancel</button>
+    <button id="pause-btn" class="btn-secondary hidden" style="margin-top: 6px;">Pause (keep progress)</button>
+    <button id="cancel-btn" class="btn-warning hidden" style="margin-top: 6px;">Cancel (discard progress)</button>
   </div>
 
   <div id="progress"></div>

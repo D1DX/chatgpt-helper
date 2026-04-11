@@ -8,11 +8,61 @@ if (!window.__chatgptExportLoaded) {
   const LIMIT = 100;
   const DELAY_INITIAL = 800;
   const DELAY_MAX = 60000;
+  const CHECKPOINT_KEY = 'export_checkpoint';
 
   let delayMs = DELAY_INITIAL;
   let abortRequested = false;
+  let pauseRequested = false;
   let running = false;
   let lastStatus = null;
+  let currentCheckpoint = null;  // in-memory mirror of chrome.storage.local[CHECKPOINT_KEY]
+
+  // --- Checkpoint persistence ---
+  async function loadCheckpoint() {
+    try {
+      const result = await chrome.storage.local.get(CHECKPOINT_KEY);
+      return result[CHECKPOINT_KEY] || null;
+    } catch (e) {
+      D('loadCheckpoint: error', e.message);
+      return null;
+    }
+  }
+
+  async function saveCheckpoint(cp) {
+    try {
+      cp.lastUpdate = new Date().toISOString();
+      currentCheckpoint = cp;
+      await chrome.storage.local.set({ [CHECKPOINT_KEY]: cp });
+    } catch (e) {
+      D('saveCheckpoint: error', e.message);
+    }
+  }
+
+  async function clearCheckpoint() {
+    try {
+      await chrome.storage.local.remove(CHECKPOINT_KEY);
+      currentCheckpoint = null;
+    } catch (e) {
+      D('clearCheckpoint: error', e.message);
+    }
+  }
+
+  function optionsMatch(a, b) {
+    if (!a || !b) return false;
+    // Mode guard: list-mode options must not match retry-mode options
+    const aIsRetry = Array.isArray(a._retryIds) && a._retryIds.length > 0;
+    const bIsRetry = Array.isArray(b._retryIds) && b._retryIds.length > 0;
+    if (aIsRetry !== bIsRetry) return false;
+    if (aIsRetry) {
+      // For retry mode, the ID list defines identity
+      if (a._retryIds.length !== b._retryIds.length) return false;
+      const as = new Set(a._retryIds);
+      for (const id of b._retryIds) if (!as.has(id)) return false;
+      return (a.format ?? null) === (b.format ?? null);
+    }
+    const keys = ['project', 'source', 'dateFrom', 'dateTo', 'keyword', 'limit', 'attachments', 'format'];
+    return keys.every((k) => (a[k] ?? null) === (b[k] ?? null));
+  }
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const D = (...args) => console.log('[ChatGPT Helper]', ...args);
@@ -43,6 +93,7 @@ if (!window.__chatgptExportLoaded) {
 
   function checkAbort() {
     if (abortRequested) throw new Error('Cancelled by user');
+    if (pauseRequested) throw new Error('Paused by user');
   }
 
   async function getAuth() {
@@ -322,6 +373,169 @@ if (!window.__chatgptExportLoaded) {
     }
   }
 
+  // --- Build target list from filters (list + filter phase) ---
+  async function buildTargetList(options, auth) {
+    const isProjectFilter = options.project && options.project !== 'all' && options.project !== 'inbox';
+    let all = [];
+
+    if (isProjectFilter) {
+      D('buildTargetList: project filter', options.project);
+      progress('Listing project conversations…', 5);
+      const projectConvs = await listProjectConversations(options.project, auth);
+      all.push(...projectConvs.map((c) => ({ ...c, _source: 'active' })));
+    } else {
+      const hasClientFilters = options.keyword || options.dateFrom || options.dateTo
+        || options.project === 'inbox';
+      const earlyLimit = (!hasClientFilters && options.limit > 0) ? options.limit : 0;
+      D('buildTargetList: hasClientFilters =', hasClientFilters, 'earlyLimit =', earlyLimit);
+
+      if (options.source === 'active' || options.source === 'both') {
+        checkAbort();
+        progress('Listing active conversations…', 5);
+        const active = await listConversations(false, auth, earlyLimit);
+        all.push(...active.map((c) => ({ ...c, _source: 'active' })));
+      }
+      if (options.source === 'archived' || options.source === 'both') {
+        if (earlyLimit > 0 && all.length >= earlyLimit) {
+          D('buildTargetList: skipping archived — earlyLimit satisfied');
+        } else {
+          checkAbort();
+          progress('Listing archived conversations…', 10);
+          await sleep(delayMs);
+          const remaining = earlyLimit > 0 ? earlyLimit - all.length : 0;
+          const archived = await listConversations(true, auth, remaining);
+          all.push(...archived.map((c) => ({ ...c, _source: 'archived' })));
+        }
+      }
+    }
+
+    const seen = new Set();
+    all = all.filter((c) => {
+      if (seen.has(c.id)) return false;
+      seen.add(c.id);
+      return true;
+    });
+
+    return filterConversations(all, options);
+  }
+
+  // --- Build export data object from a checkpoint ---
+  function buildExportData(cp, auth) {
+    const conversations = Object.values(cp.fetched);
+    const errors = cp.failed || [];
+    const attachmentMap = cp.attachments || {};
+    return {
+      exported_at: new Date().toISOString(),
+      account: (auth && auth.accountId) || cp.account || 'unknown',
+      filters: cp.options,
+      stats: {
+        total_listed: cp.targetIds.length,
+        after_filters: cp.targetIds.length,
+        fetched: conversations.length,
+        errors: errors.length,
+        attachments: Object.keys(attachmentMap).length,
+        mode: cp.mode,
+      },
+      errors,
+      conversations,
+      ...(Object.keys(attachmentMap).length > 0 ? { attachments: attachmentMap } : {}),
+    };
+  }
+
+  // --- Download export data as a file (format depends on options.format) ---
+  function downloadExport(exportData, fmt) {
+    const datestamp = new Date().toISOString().slice(0, 10);
+    const formats = {
+      json:     { ext: 'json',  mime: 'application/json',        fn: () => JSON.stringify(exportData, null, 2) },
+      markdown: { ext: 'md',    mime: 'text/markdown',           fn: () => toMarkdown(exportData) },
+      jsonl:    { ext: 'jsonl', mime: 'application/x-jsonlines', fn: () => toJSONL(exportData) },
+      html:     { ext: 'html',  mime: 'text/html',               fn: () => toHTML(exportData) },
+      csv:      { ext: 'csv',   mime: 'text/csv',                fn: () => toCSV(exportData) },
+      txt:      { ext: 'txt',   mime: 'text/plain',              fn: () => toPlainText(exportData) },
+    };
+    const { ext, mime, fn } = formats[fmt] || formats.json;
+    const content = fn();
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `chatgpt-export-${datestamp}.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    return { ext, size: content.length };
+  }
+
+  // --- Run fetch loop over a target list, writing checkpoint after every item ---
+  async function fetchLoop(cp, auth) {
+    const remaining = cp.targetIds.filter((id) => !cp.fetched[id]);
+    D('fetchLoop: total =', cp.targetIds.length, 'already fetched =', Object.keys(cp.fetched).length, 'remaining =', remaining.length);
+
+    if (remaining.length === 0) {
+      progress('All target conversations already fetched', 90);
+      return;
+    }
+
+    for (let i = 0; i < remaining.length; i++) {
+      checkAbort();
+      const id = remaining[i];
+      const alreadyDone = Object.keys(cp.fetched).length;
+      const totalTarget = cp.targetIds.length;
+      const pct = 15 + Math.round(((alreadyDone + 1) / totalTarget) * 75);
+      progress(`[${alreadyDone + 1}/${totalTarget}] ${id.slice(0, 8)}…`, pct);
+
+      let data = null;
+      let attachmentsFetched = null;
+      try {
+        D('fetchLoop: fetching', id);
+        data = await api(`/conversation/${id}`, auth);
+
+        if (cp.options.attachments) {
+          const files = extractFileRefs(data);
+          if (files.length > 0) {
+            D('fetchLoop: fetching', files.length, 'attachments for', id);
+            const fetched = [];
+            for (const f of files) {
+              checkAbort();
+              if (f.url) {
+                const dataUrl = await fetchAttachment(f.url, auth);
+                fetched.push({ ...f, data: dataUrl });
+              } else {
+                fetched.push(f);
+              }
+              await sleep(delayMs);
+            }
+            attachmentsFetched = fetched;
+          }
+        }
+
+        // Only mark as fetched after conv + attachments both succeeded
+        cp.fetched[id] = data;
+        if (attachmentsFetched) {
+          cp.attachments = cp.attachments || {};
+          cp.attachments[id] = attachmentsFetched;
+        }
+        // Clear any prior failure entry for this id on success
+        if (cp.failed && cp.failed.length) {
+          cp.failed = cp.failed.filter((f) => f.id !== id);
+        }
+      } catch (e) {
+        if (e.message === 'Cancelled by user' || e.message === 'Paused by user') throw e;
+        D('fetchLoop: ERROR fetching', id, ':', e.message);
+        cp.failed = cp.failed || [];
+        cp.failed = cp.failed.filter((f) => f.id !== id);
+        cp.failed.push({ id, title: id.slice(0, 8), error: e.message });
+      }
+
+      // Checkpoint after every fetch — this is the whole point
+      await saveCheckpoint(cp);
+
+      if (i < remaining.length - 1) await sleep(delayMs);
+    }
+  }
+
+  // --- Main export entry point ---
   async function runExport(options) {
     D('========== runExport START ==========');
     D('runExport: options =', JSON.stringify(options, null, 2));
@@ -330,163 +544,115 @@ if (!window.__chatgptExportLoaded) {
       const auth = await getAuth();
       D('runExport: auth OK, accountId =', auth.accountId);
 
-      const isProjectFilter = options.project && options.project !== 'all' && options.project !== 'inbox';
-      D('runExport: isProjectFilter =', isProjectFilter, ', project =', options.project);
+      // Resume mode: options include _resume flag and we have a matching checkpoint
+      let cp = await loadCheckpoint();
 
-      let all = [];
-
-      if (isProjectFilter) {
-        D('runExport: fetching project conversations for', options.project);
-        progress('Listing project conversations…', 5);
-        const projectConvs = await listProjectConversations(options.project, auth);
-        all.push(...projectConvs.map((c) => ({ ...c, _source: 'active' })));
-        D('runExport: project conversations count =', all.length);
+      if (options._resume && cp && optionsMatch(cp.options, options)) {
+        D('runExport: RESUMING from existing checkpoint');
+        cp.paused = false;
+        progress(`Resuming — ${Object.keys(cp.fetched).length}/${cp.targetIds.length} already fetched`, 15);
+        await saveCheckpoint(cp);
+      } else if (options._retryIds && Array.isArray(options._retryIds) && options._retryIds.length > 0) {
+        D('runExport: RETRY-BY-ID mode with', options._retryIds.length, 'ids');
+        cp = {
+          runId: Date.now().toString(),
+          mode: 'retry',
+          options,
+          startedAt: new Date().toISOString(),
+          account: auth.accountId,
+          targetIds: options._retryIds.slice(),
+          fetched: {},
+          failed: [],
+          attachments: {},
+          paused: false,
+        };
+        progress(`Retry-by-ID: ${cp.targetIds.length} conversations queued`, 15);
+        await saveCheckpoint(cp);
       } else {
-        const hasClientFilters = options.keyword || options.dateFrom || options.dateTo
-          || options.project === 'inbox';
-        const earlyLimit = (!hasClientFilters && options.limit > 0) ? options.limit : 0;
-        D('runExport: hasClientFilters =', hasClientFilters, ', earlyLimit =', earlyLimit);
-
-        if (options.source === 'active' || options.source === 'both') {
-          checkAbort();
-          D('runExport: listing ACTIVE conversations, earlyLimit =', earlyLimit);
-          progress('Listing active conversations…', 5);
-          const active = await listConversations(false, auth, earlyLimit);
-          D('runExport: active result count =', active.length);
-          all.push(...active.map((c) => ({ ...c, _source: 'active' })));
+        // Fresh list-based run — build target list, then create new checkpoint
+        D('runExport: FRESH run — building target list');
+        const filtered = await buildTargetList(options, auth);
+        progress(`Found ${filtered.length} conversations`, 15);
+        if (filtered.length === 0) {
+          await clearCheckpoint();
+          done('No conversations match your filters.');
+          return;
         }
-        if (options.source === 'archived' || options.source === 'both') {
-          if (earlyLimit > 0 && all.length >= earlyLimit) {
-            D('runExport: skipping archived — earlyLimit already satisfied');
-          } else {
-            checkAbort();
-            D('runExport: listing ARCHIVED conversations');
-            progress('Listing archived conversations…', 10);
-            await sleep(delayMs);
-            const remaining = earlyLimit > 0 ? earlyLimit - all.length : 0;
-            const archived = await listConversations(true, auth, remaining);
-            D('runExport: archived result count =', archived.length);
-            all.push(...archived.map((c) => ({ ...c, _source: 'archived' })));
-          }
-        }
+        cp = {
+          runId: Date.now().toString(),
+          mode: 'list',
+          options,
+          startedAt: new Date().toISOString(),
+          account: auth.accountId,
+          targetIds: filtered.map((c) => c.id),
+          // Preserve source labels from the listing phase for later use
+          targetMeta: Object.fromEntries(filtered.map((c) => [c.id, { title: c.title, _source: c._source }])),
+          fetched: {},
+          failed: [],
+          attachments: {},
+          paused: false,
+        };
+        await saveCheckpoint(cp);
       }
 
-      D('runExport: total before dedup =', all.length);
-      const seen = new Set();
-      all = all.filter((c) => {
-        if (seen.has(c.id)) return false;
-        seen.add(c.id);
-        return true;
-      });
-      D('runExport: total after dedup =', all.length);
-
-      D('runExport: calling filterConversations...');
-      const filtered = filterConversations(all, options);
-      progress(`Found ${filtered.length} conversations`, 15);
-
-      if (filtered.length === 0) {
-        D('runExport: 0 results after filter — returning');
-        done('No conversations match your filters.');
-        return;
-      }
-
-      const conversations = [];
-      const errors = [];
-      const attachmentMap = {};
-
-      for (let i = 0; i < filtered.length; i++) {
-        checkAbort();
-        const c = filtered[i];
-        const pct = 15 + Math.round((i / filtered.length) * 75);
-        progress(`[${i + 1}/${filtered.length}] ${c.title || 'untitled'}`, pct);
-
-        try {
-          D('runExport: fetching full conversation', c.id, c.title);
-          const data = await api(`/conversation/${c.id}`, auth);
-          data._source = c._source;
-          conversations.push(data);
-
-          if (options.attachments) {
-            const files = extractFileRefs(data);
-            if (files.length > 0) {
-              D('runExport: fetching', files.length, 'attachments for', c.id);
-              const fetched = [];
-              for (const f of files) {
-                checkAbort();
-                if (f.url) {
-                  const dataUrl = await fetchAttachment(f.url, auth);
-                  fetched.push({ ...f, data: dataUrl });
-                } else {
-                  fetched.push(f);
-                }
-                await sleep(delayMs);
-              }
-              attachmentMap[c.id] = fetched;
-            }
-          }
-        } catch (e) {
-          if (e.message === 'Cancelled by user') throw e;
-          D('runExport: ERROR fetching conversation', c.id, ':', e.message);
-          errors.push({ id: c.id, title: c.title, error: e.message });
-        }
-
-        if (i < filtered.length - 1) await sleep(delayMs);
-      }
+      await fetchLoop(cp, auth);
 
       checkAbort();
       progress('Building export…', 92);
-      const exportData = {
-        exported_at: new Date().toISOString(),
-        account: auth.accountId || 'unknown',
-        filters: options,
-        stats: {
-          total_listed: all.length,
-          after_filters: filtered.length,
-          fetched: conversations.length,
-          errors: errors.length,
-          attachments: Object.keys(attachmentMap).length,
-        },
-        errors,
-        conversations,
-        ...(options.attachments && Object.keys(attachmentMap).length > 0
-          ? { attachments: attachmentMap }
-          : {}),
-      };
+      const exportData = buildExportData(cp, auth);
 
       const fmt = options.format || 'json';
-      const datestamp = new Date().toISOString().slice(0, 10);
-      const formats = {
-        json:     { ext: 'json',  mime: 'application/json',       fn: () => JSON.stringify(exportData, null, 2) },
-        markdown: { ext: 'md',    mime: 'text/markdown',          fn: () => toMarkdown(exportData) },
-        jsonl:    { ext: 'jsonl', mime: 'application/x-jsonlines', fn: () => toJSONL(exportData) },
-        html:     { ext: 'html',  mime: 'text/html',              fn: () => toHTML(exportData) },
-        csv:      { ext: 'csv',   mime: 'text/csv',               fn: () => toCSV(exportData) },
-        txt:      { ext: 'txt',   mime: 'text/plain',             fn: () => toPlainText(exportData) },
-      };
+      progress(`Generating ${fmt.toUpperCase()}…`, 95);
+      const { ext } = downloadExport(exportData, fmt);
+      D('runExport: download triggered —', ext);
 
-      const { ext, mime, fn } = formats[fmt];
-      progress(`Generating ${ext.toUpperCase()}…`, 95);
-      const content = fn();
-      D('runExport: generated', ext, '— size:', content.length);
+      // Completed — clear checkpoint
+      await clearCheckpoint();
 
-      progress('Downloading…', 99);
-      const blob = new Blob([content], { type: mime });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `chatgpt-export-${datestamp}.${ext}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-
+      const errCount = (cp.failed || []).length;
       done(
-        `Exported ${conversations.length} conversations as ${ext.toUpperCase()}` +
-          (errors.length ? `, ${errors.length} errors` : '')
+        `Exported ${Object.keys(cp.fetched).length} conversations as ${ext.toUpperCase()}` +
+          (errCount ? `, ${errCount} errors` : '')
       );
       D('========== runExport END ==========');
     } catch (e) {
+      if (e.message === 'Paused by user') {
+        D('runExport: PAUSED — checkpoint preserved');
+        if (currentCheckpoint) {
+          currentCheckpoint.paused = true;
+          await saveCheckpoint(currentCheckpoint);
+        }
+        const fetchedCount = currentCheckpoint ? Object.keys(currentCheckpoint.fetched).length : 0;
+        const totalCount = currentCheckpoint ? currentCheckpoint.targetIds.length : 0;
+        const text = `Paused — ${fetchedCount}/${totalCount} fetched. Open popup to resume or download partial.`;
+        running = false;
+        setStatus('done', text, Math.round((fetchedCount / (totalCount || 1)) * 100));
+        try { chrome.runtime.sendMessage({ type: 'done', text }); } catch {}
+        return;
+      }
       D('runExport: FATAL ERROR:', e.message, e.stack);
+      error(e.message);
+    }
+  }
+
+  // --- Download partial export from current checkpoint without waiting for completion ---
+  async function runDownloadPartial() {
+    D('========== runDownloadPartial ==========');
+    try {
+      const cp = await loadCheckpoint();
+      if (!cp || Object.keys(cp.fetched).length === 0) {
+        error('No checkpoint with fetched conversations found.');
+        return;
+      }
+      progress('Building partial export…', 50);
+      const auth = { accountId: cp.account };
+      const exportData = buildExportData(cp, auth);
+      exportData.stats.partial = true;
+      const fmt = cp.options.format || 'json';
+      const { ext } = downloadExport(exportData, fmt);
+      done(`Partial export: ${Object.keys(cp.fetched).length}/${cp.targetIds.length} conversations as ${ext.toUpperCase()}`);
+    } catch (e) {
+      D('runDownloadPartial: error', e.message);
       error(e.message);
     }
   }
@@ -654,9 +820,57 @@ if (!window.__chatgptExportLoaded) {
       return;
     }
 
+    if (msg.action === 'get-checkpoint') {
+      loadCheckpoint().then((cp) => {
+        if (!cp) {
+          sendResponse({ hasCheckpoint: false });
+          return;
+        }
+        sendResponse({
+          hasCheckpoint: true,
+          checkpoint: {
+            runId: cp.runId,
+            mode: cp.mode,
+            startedAt: cp.startedAt,
+            lastUpdate: cp.lastUpdate,
+            paused: cp.paused,
+            total: cp.targetIds.length,
+            fetched: Object.keys(cp.fetched).length,
+            failed: (cp.failed || []).length,
+            options: cp.options,
+          },
+        });
+      });
+      return true;
+    }
+
+    if (msg.action === 'clear-checkpoint') {
+      clearCheckpoint().then(() => sendResponse({ ok: true }));
+      return true;
+    }
+
+    if (msg.action === 'download-partial') {
+      if (running) {
+        sendResponse({ ok: false, reason: 'Cannot download while export is running — pause first' });
+        return;
+      }
+      runDownloadPartial();
+      sendResponse({ ok: true });
+      return;
+    }
+
     if (msg.action === 'abort') {
       D('Abort requested');
       abortRequested = true;
+      // Also clear the checkpoint on abort — user wants it gone
+      clearCheckpoint();
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (msg.action === 'pause') {
+      D('Pause requested');
+      pauseRequested = true;
       sendResponse({ ok: true });
       return;
     }
@@ -678,6 +892,7 @@ if (!window.__chatgptExportLoaded) {
       }
       running = true;
       abortRequested = false;
+      pauseRequested = false;
       delayMs = DELAY_INITIAL;
       runExport(msg.options);
       sendResponse({ ok: true });
@@ -690,6 +905,7 @@ if (!window.__chatgptExportLoaded) {
       }
       running = true;
       abortRequested = false;
+      pauseRequested = false;
       delayMs = DELAY_INITIAL;
       runExportMemories(msg.options);
       sendResponse({ ok: true });
