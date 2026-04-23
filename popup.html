@@ -235,6 +235,7 @@
   <div class="tabs">
     <div class="tab active" data-tab="export">Export</div>
     <div class="tab" data-tab="retry">Retry IDs</div>
+    <div class="tab" data-tab="attachments">Attachments</div>
     <div class="tab" data-tab="memories">Memories</div>
   </div>
 
@@ -326,6 +327,20 @@
     </div>
   </div>
 
+  <!-- Attachments-only panel (fetch attachments from an existing exported JSON) -->
+  <div id="attachments-panel" class="hidden">
+    <div class="field">
+      <label>Existing export JSON</label>
+      <input type="file" id="attachments-file" accept=".json,application/json">
+      <div class="hint" id="attachments-file-info">Select a previously exported chatgpt-export-*.json</div>
+    </div>
+    <div class="hint">
+      Reads the file locally, walks every conversation for <code>asset_pointer</code> + <code>attachments[]</code>,
+      fetches only the binaries, and downloads a merged <code>chatgpt-export-YYYY-MM-DD+attachments.json</code>.
+      Aborts if the first &gt;5 fetches all return 404.
+    </div>
+  </div>
+
   <!-- Memories options -->
   <div id="memories-options" class="hidden">
     <div class="field">
@@ -342,6 +357,7 @@
   <div class="actions">
     <button id="export-btn" class="btn-primary">Export Conversations</button>
     <button id="retry-btn" class="btn-primary hidden">Fetch IDs</button>
+    <button id="attachments-btn" class="btn-primary hidden">Fetch Attachments</button>
     <button id="memories-btn" class="btn-primary hidden">Export Memories</button>
     <button id="pause-btn" class="btn-secondary hidden" style="margin-top: 6px;">Pause (keep progress)</button>
     <button id="cancel-btn" class="btn-warning hidden" style="margin-top: 6px;">Cancel (discard progress)</button>

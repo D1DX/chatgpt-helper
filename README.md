@@ -12,6 +12,8 @@ Chrome extension for exporting ChatGPT conversations and memories. Export in 6 f
 | Action | Description |
 | ------ | ----------- |
 | **Export Conversations** | Download conversations as JSON, Markdown, JSONL, HTML, CSV, or plain text |
+| **Retry IDs** | Re-fetch specific conversation IDs (useful for failed items from a prior run) |
+| **Attachments** | Read an existing export JSON and download only the attachments it references, merged into a new file |
 | **Export Memories** | Download all ChatGPT memories as JSON, Markdown, or plain text |
 
 ## How It Works

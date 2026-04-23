@@ -25,12 +25,15 @@ function updateUI() {
   const isMemories = currentTab === 'memories';
   const isRetry = currentTab === 'retry';
   const isExport = currentTab === 'export';
+  const isAttachments = currentTab === 'attachments';
 
   $('export-filters').classList.toggle('hidden', !isExport);
   $('retry-panel').classList.toggle('hidden', !isRetry);
+  $('attachments-panel').classList.toggle('hidden', !isAttachments);
   $('memories-options').classList.toggle('hidden', !isMemories);
   $('export-btn').classList.toggle('hidden', !isExport);
   $('retry-btn').classList.toggle('hidden', !isRetry);
+  $('attachments-btn').classList.toggle('hidden', !isAttachments);
   $('memories-btn').classList.toggle('hidden', !isMemories);
 
   if (isExport) {
@@ -54,7 +57,7 @@ $('export-all').addEventListener('change', () => {
 });
 
 // --- UI state for running/idle ---
-const ACTION_BTNS = ['export-btn', 'retry-btn', 'memories-btn', 'cp-resume-btn', 'cp-download-btn', 'cp-discard-btn'];
+const ACTION_BTNS = ['export-btn', 'retry-btn', 'attachments-btn', 'memories-btn', 'cp-resume-btn', 'cp-download-btn', 'cp-discard-btn'];
 
 function setRunningUI(isRunning) {
   ACTION_BTNS.forEach((id) => {
@@ -312,6 +315,80 @@ $('retry-btn').addEventListener('click', async () => {
     return;
   }
   sendAction('export', options);
+});
+
+// --- Attachments-only: read existing export, fetch attachments, merge ---
+$('attachments-file').addEventListener('change', () => {
+  const f = $('attachments-file').files[0];
+  const info = $('attachments-file-info');
+  if (!f) {
+    info.textContent = 'Select a previously exported chatgpt-export-*.json';
+    return;
+  }
+  const sizeMB = (f.size / 1024 / 1024).toFixed(1);
+  info.textContent = `${f.name} — ${sizeMB} MB`;
+});
+
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error || new Error('file read failed'));
+    r.readAsText(file);
+  });
+}
+
+$('attachments-btn').addEventListener('click', async () => {
+  const f = $('attachments-file').files[0];
+  if (!f) {
+    $('progress').textContent = 'Select an export JSON first.';
+    $('progress').className = 'error';
+    return;
+  }
+
+  let parsed;
+  try {
+    $('progress').textContent = 'Reading file…';
+    $('progress').className = '';
+    const text = await readFileAsText(f);
+    parsed = JSON.parse(text);
+  } catch (e) {
+    $('progress').textContent = `Invalid JSON: ${e.message}`;
+    $('progress').className = 'error';
+    return;
+  }
+
+  if (!parsed || !Array.isArray(parsed.conversations)) {
+    $('progress').textContent = 'File is not a chatgpt-export JSON (missing conversations[]).';
+    $('progress').className = 'error';
+    return;
+  }
+
+  const options = {
+    _attachmentsOnly: true,
+    _sourceExportedAt: parsed.exported_at || null,
+    _sourceExport: parsed,
+  };
+
+  const tab = await injectAndGetTab();
+  if (!tab) { sendAction('attachments-only', options); return; }
+  const cp = await refreshCheckpointBanner(tab);
+  if (cp) {
+    const msg = `A previous run has ${cp.fetched}/${cp.total} fetched.\n\n` +
+      `OK = discard it and start this attachments-only run.\nCancel = keep previous checkpoint.`;
+    if (!confirm(msg)) return;
+    chrome.tabs.sendMessage(tab.id, { action: 'clear-checkpoint' }, () => {
+      if (chrome.runtime.lastError) {
+        $('progress').textContent = 'Failed to clear checkpoint';
+        $('progress').className = 'error';
+        return;
+      }
+      renderCheckpointBanner(null);
+      sendAction('attachments-only', options);
+    });
+    return;
+  }
+  sendAction('attachments-only', options);
 });
 
 // --- Pause (keep checkpoint) ---

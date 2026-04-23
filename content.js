@@ -49,10 +49,17 @@ if (!window.__chatgptExportLoaded) {
 
   function optionsMatch(a, b) {
     if (!a || !b) return false;
-    // Mode guard: list-mode options must not match retry-mode options
+    // Mode guard: list-mode, retry-mode, and attachments-only options must not cross-match
     const aIsRetry = Array.isArray(a._retryIds) && a._retryIds.length > 0;
     const bIsRetry = Array.isArray(b._retryIds) && b._retryIds.length > 0;
+    const aIsAttOnly = !!a._attachmentsOnly;
+    const bIsAttOnly = !!b._attachmentsOnly;
     if (aIsRetry !== bIsRetry) return false;
+    if (aIsAttOnly !== bIsAttOnly) return false;
+    if (aIsAttOnly) {
+      // Identity = exported_at of source file
+      return (a._sourceExportedAt ?? null) === (b._sourceExportedAt ?? null);
+    }
     if (aIsRetry) {
       // For retry mode, the ID list defines identity
       if (a._retryIds.length !== b._retryIds.length) return false;
@@ -307,36 +314,44 @@ if (!window.__chatgptExportLoaded) {
     return files;
   }
 
-  async function fetchAttachment(url, auth) {
-    D('fetchAttachment:', url);
+  async function fetchAttachmentDetailed(url, auth) {
+    D('fetchAttachmentDetailed:', url);
     try {
       let resolvedUrl = url;
 
       // file-service:// URLs need two-step resolution
       if (url && url.startsWith('file-service://')) {
         const fileId = url.replace('file-service://', '');
-        D('fetchAttachment: resolving file-service URL, fileId =', fileId);
-        const meta = await api(`/files/download/${fileId}?post_id=&inline=false`, auth);
-        if (!meta.download_url) {
-          D('fetchAttachment: no download_url in response:', JSON.stringify(meta));
-          return null;
+        D('fetchAttachmentDetailed: resolving file-service URL, fileId =', fileId);
+        try {
+          const meta = await api(`/files/download/${fileId}?post_id=&inline=false`, auth);
+          if (!meta.download_url) {
+            D('fetchAttachmentDetailed: no download_url in response:', JSON.stringify(meta));
+            return { ok: false, status: 0, reason: 'no-download-url' };
+          }
+          resolvedUrl = meta.download_url;
+          D('fetchAttachmentDetailed: resolved to', resolvedUrl);
+        } catch (e) {
+          // api() throws "STATUS STATUSTEXT — /path" — extract status code
+          const m = /^(\d{3})\s/.exec(e.message || '');
+          const status = m ? parseInt(m[1]) : 0;
+          D('fetchAttachmentDetailed: resolve failed', status, e.message);
+          return { ok: false, status, reason: 'resolve-failed' };
         }
-        resolvedUrl = meta.download_url;
-        D('fetchAttachment: resolved to', resolvedUrl);
       }
 
-      if (!resolvedUrl) return null;
+      if (!resolvedUrl) return { ok: false, status: 0, reason: 'no-url' };
 
       let attempt = 0;
       while (true) {
         attempt++;
         const fetchUrl = resolvedUrl.startsWith('http') ? resolvedUrl : `https://chatgpt.com${resolvedUrl}`;
-        D('fetchAttachment: fetching', fetchUrl, attempt > 1 ? `(attempt ${attempt})` : '');
+        D('fetchAttachmentDetailed: fetching', fetchUrl, attempt > 1 ? `(attempt ${attempt})` : '');
         const res = await fetch(fetchUrl, {
           credentials: 'include',
           headers: { Authorization: `Bearer ${auth.token}` },
         });
-        D('fetchAttachment: status =', res.status);
+        D('fetchAttachmentDetailed: status =', res.status);
 
         if (res.status === 429) {
           delayMs = Math.min(delayMs * 2, DELAY_MAX);
@@ -345,15 +360,15 @@ if (!window.__chatgptExportLoaded) {
           const waitMs = Math.max(retryAfter * 1000, delayMs) + cooldown;
           const waitSec = Math.round(waitMs / 1000);
           const waitMin = waitSec >= 60 ? `${(waitSec / 60).toFixed(1)}min` : `${waitSec}s`;
-          D('fetchAttachment 429: waiting', waitMs, 'ms, attempt =', attempt);
+          D('fetchAttachmentDetailed 429: waiting', waitMs, 'ms, attempt =', attempt);
           progress(`Rate limited on attachment — waiting ${waitMin}… (attempt ${attempt})`);
           await sleep(waitMs);
           continue;
         }
 
         if (!res.ok) {
-          D('fetchAttachment: failed with', res.status);
-          return null;
+          D('fetchAttachmentDetailed: failed with', res.status);
+          return { ok: false, status: res.status, reason: 'http-error' };
         }
 
         if (delayMs > DELAY_INITIAL) {
@@ -361,16 +376,23 @@ if (!window.__chatgptExportLoaded) {
         }
 
         const blob = await res.blob();
-        return new Promise((resolve) => {
+        const dataUrl = await new Promise((resolve) => {
           const reader = new FileReader();
           reader.onloadend = () => resolve(reader.result);
           reader.readAsDataURL(blob);
         });
+        return { ok: true, status: res.status, data: dataUrl };
       }
     } catch (e) {
-      D('fetchAttachment: error =', e.message);
-      return null;
+      D('fetchAttachmentDetailed: error =', e.message);
+      return { ok: false, status: 0, reason: e.message };
     }
+  }
+
+  // Back-compat wrapper — returns dataURL or null, used by the live export path
+  async function fetchAttachment(url, auth) {
+    const r = await fetchAttachmentDetailed(url, auth);
+    return r.ok ? r.data : null;
   }
 
   // --- Build target list from filters (list + filter phase) ---
@@ -631,6 +653,203 @@ if (!window.__chatgptExportLoaded) {
         return;
       }
       D('runExport: FATAL ERROR:', e.message, e.stack);
+      error(e.message);
+    }
+  }
+
+  // --- Attachments-only: read an existing export, fetch only the attachments, merge, download ---
+  async function runAttachmentsOnly(options) {
+    D('========== runAttachmentsOnly START ==========');
+    D('runAttachmentsOnly: sourceExportedAt =', options._sourceExportedAt);
+    try {
+      const sourceExport = options._sourceExport;
+      if (!sourceExport || !Array.isArray(sourceExport.conversations)) {
+        throw new Error('Invalid source export: missing conversations array');
+      }
+
+      progress('Authenticating…', 0);
+      const auth = await getAuth();
+
+      // Build per-conversation file list from the source JSON
+      progress('Scanning source JSON for attachments…', 5);
+      const plan = []; // [{convId, fileIndex, file}]
+      const filesByConv = {}; // convId → [files[]]
+      for (const conv of sourceExport.conversations) {
+        if (!conv || !conv.id) continue;
+        const files = extractFileRefs(conv);
+        if (files.length === 0) continue;
+        filesByConv[conv.id] = files;
+        for (let i = 0; i < files.length; i++) {
+          plan.push({ convId: conv.id, fileIndex: i, file: files[i] });
+        }
+      }
+      const totalFiles = plan.length;
+      D('runAttachmentsOnly: plan — convs with files =', Object.keys(filesByConv).length, 'total files =', totalFiles);
+      progress(`Found ${totalFiles} attachments across ${Object.keys(filesByConv).length} conversations`, 10);
+
+      if (totalFiles === 0) {
+        done('No attachments found in source JSON.');
+        return;
+      }
+
+      // Load or create checkpoint
+      let cp = await loadCheckpoint();
+      const resumeable = cp && cp.mode === 'attachments-only' && optionsMatch(cp.options, options);
+      if (options._resume && resumeable) {
+        D('runAttachmentsOnly: RESUMING from checkpoint');
+        cp.paused = false;
+        progress(`Resuming — ${Object.keys(cp.fetchedFiles).length}/${totalFiles} files already fetched`, 12);
+        await saveCheckpoint(cp);
+      } else {
+        cp = {
+          runId: Date.now().toString(),
+          mode: 'attachments-only',
+          options,
+          startedAt: new Date().toISOString(),
+          account: auth.accountId,
+          // For banner compat: targetIds = per-file keys (conv:idx)
+          targetIds: plan.map((p) => `${p.convId}:${p.fileIndex}`),
+          fetched: {}, // unused in this mode; kept for banner compat
+          fetchedFiles: {}, // key "convId:idx" → file with data
+          failed: [],
+          skipped: [], // 404s after the early-abort guard passes
+          earlyAttempts: 0,
+          earlyFails: 0,
+          paused: false,
+        };
+        await saveCheckpoint(cp);
+      }
+
+      // Fetch loop with 404 early-abort guard (first >5 attempts 100% 404 → hard fail)
+      for (let i = 0; i < plan.length; i++) {
+        checkAbort();
+        const p = plan[i];
+        const key = `${p.convId}:${p.fileIndex}`;
+        if (cp.fetchedFiles[key] || (cp.skipped || []).some((s) => s.key === key)) {
+          continue; // already done this file
+        }
+
+        const doneCount = Object.keys(cp.fetchedFiles).length + (cp.skipped || []).length;
+        const pct = 15 + Math.round(((doneCount + 1) / totalFiles) * 80);
+        progress(`[${doneCount + 1}/${totalFiles}] ${p.convId.slice(0, 8)}… ${p.file.name || ''}`.trim(), pct);
+
+        let result = null;
+        if (!p.file.url) {
+          // Record with no URL (e.g. attachment by id only) — preserve metadata without data
+          cp.fetchedFiles[key] = { ...p.file, data: null, _note: 'no-url-in-source' };
+        } else {
+          try {
+            result = await fetchAttachmentDetailed(p.file.url, auth);
+          } catch (e) {
+            if (e.message === 'Cancelled by user' || e.message === 'Paused by user') throw e;
+            result = { ok: false, status: 0, reason: e.message };
+          }
+
+          if (result.ok) {
+            cp.fetchedFiles[key] = { ...p.file, data: result.data };
+          } else if (result.status === 404) {
+            cp.earlyAttempts++;
+            cp.earlyFails++;
+            // Early-abort guard: >5 attempts and 100% of them 404 → dead session / URL format change
+            if (cp.earlyAttempts > 5 && cp.earlyFails === cp.earlyAttempts) {
+              await saveCheckpoint(cp);
+              throw new Error(
+                `Aborted: first ${cp.earlyAttempts} attempts all returned 404. ` +
+                `Session expired or URL format changed — re-login to chatgpt.com and retry.`
+              );
+            }
+            cp.skipped = cp.skipped || [];
+            cp.skipped.push({ key, convId: p.convId, name: p.file.name || null, url: p.file.url, status: 404 });
+          } else {
+            cp.earlyAttempts++;
+            cp.failed.push({ key, convId: p.convId, name: p.file.name || null, url: p.file.url, status: result.status, reason: result.reason });
+          }
+
+          // If we've had a success, fully disarm the early-abort guard
+          if (result.ok) {
+            cp.earlyAttempts = 0;
+            cp.earlyFails = 0;
+          }
+        }
+
+        await saveCheckpoint(cp);
+        if (i < plan.length - 1) await sleep(delayMs);
+      }
+
+      // Merge fetched files back into per-conversation attachment map
+      checkAbort();
+      progress('Building merged export…', 95);
+      const attachmentMap = {};
+      for (const p of plan) {
+        const key = `${p.convId}:${p.fileIndex}`;
+        const got = cp.fetchedFiles[key];
+        if (got) {
+          attachmentMap[p.convId] = attachmentMap[p.convId] || [];
+          attachmentMap[p.convId].push(got);
+        }
+      }
+
+      // Output: clone source, overlay attachments map + updated stats
+      const merged = {
+        ...sourceExport,
+        attachments: { ...(sourceExport.attachments || {}), ...attachmentMap },
+        stats: {
+          ...(sourceExport.stats || {}),
+          attachments: Object.keys({ ...(sourceExport.attachments || {}), ...attachmentMap }).length,
+          attachments_fetched: Object.keys(cp.fetchedFiles).length,
+          attachments_skipped_404: (cp.skipped || []).length,
+          attachments_failed: (cp.failed || []).length,
+        },
+        attachments_run: {
+          ran_at: new Date().toISOString(),
+          source_exported_at: sourceExport.exported_at || null,
+          total_files: totalFiles,
+          fetched: Object.keys(cp.fetchedFiles).length,
+          skipped_404: (cp.skipped || []).length,
+          failed: (cp.failed || []).length,
+          failures: cp.failed || [],
+        },
+      };
+
+      // Filename: chatgpt-export-{sourceDate}+attachments.json
+      const sourceDate = (sourceExport.exported_at || '').slice(0, 10) || new Date().toISOString().slice(0, 10);
+      const content = JSON.stringify(merged, null, 2);
+      const blob = new Blob([content], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `chatgpt-export-${sourceDate}+attachments.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      await clearCheckpoint();
+      const fetched = Object.keys(cp.fetchedFiles).length;
+      const skipped = (cp.skipped || []).length;
+      const failed = (cp.failed || []).length;
+      done(
+        `Attachments: ${fetched}/${totalFiles} fetched` +
+          (skipped ? `, ${skipped} skipped (404)` : '') +
+          (failed ? `, ${failed} failed` : '')
+      );
+      D('========== runAttachmentsOnly END ==========');
+    } catch (e) {
+      if (e.message === 'Paused by user') {
+        D('runAttachmentsOnly: PAUSED');
+        if (currentCheckpoint) {
+          currentCheckpoint.paused = true;
+          await saveCheckpoint(currentCheckpoint);
+        }
+        const fetchedCount = currentCheckpoint ? Object.keys(currentCheckpoint.fetchedFiles || {}).length : 0;
+        const totalCount = currentCheckpoint ? currentCheckpoint.targetIds.length : 0;
+        const text = `Paused — ${fetchedCount}/${totalCount} files fetched.`;
+        running = false;
+        setStatus('done', text, Math.round((fetchedCount / (totalCount || 1)) * 100));
+        try { chrome.runtime.sendMessage({ type: 'done', text }); } catch {}
+        return;
+      }
+      D('runAttachmentsOnly: FATAL ERROR:', e.message, e.stack);
       error(e.message);
     }
   }
@@ -908,6 +1127,19 @@ if (!window.__chatgptExportLoaded) {
       pauseRequested = false;
       delayMs = DELAY_INITIAL;
       runExportMemories(msg.options);
+      sendResponse({ ok: true });
+    }
+
+    if (msg.action === 'attachments-only') {
+      if (running) {
+        sendResponse({ ok: false, reason: 'Export already in progress' });
+        return;
+      }
+      running = true;
+      abortRequested = false;
+      pauseRequested = false;
+      delayMs = DELAY_INITIAL;
+      runAttachmentsOnly(msg.options);
       sendResponse({ ok: true });
     }
   });
