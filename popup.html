@@ -336,8 +336,10 @@
     </div>
     <div class="hint">
       Reads the file locally, walks every conversation for <code>asset_pointer</code> + <code>attachments[]</code>,
-      fetches only the binaries, and downloads a merged <code>chatgpt-export-YYYY-MM-DD+attachments.json</code>.
-      Aborts if the first &gt;5 fetches all return 404.
+      fetches the binaries, and downloads ZIP volumes:
+      <code>-vol01.zip</code>, <code>-vol02.zip</code>, … (~100 MB each),
+      plus a <code>-metadata.zip</code> containing <code>conversations.json</code> verbatim and
+      <code>attachments-index.json</code>. Aborts if the first &gt;5 fetches all return 404.
     </div>
   </div>
 

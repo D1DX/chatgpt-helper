@@ -338,6 +338,9 @@ function readFileAsText(file) {
   });
 }
 
+const ATTACH_SOURCE_KEY = 'attach_source_v1';
+const ATTACH_META_KEY = 'attach_source_meta_v1';
+
 $('attachments-btn').addEventListener('click', async () => {
   const f = $('attachments-file').files[0];
   if (!f) {
@@ -346,28 +349,45 @@ $('attachments-btn').addEventListener('click', async () => {
     return;
   }
 
-  let parsed;
+  // Read + validate; parse once here, discard parsed — content script parses its own copy
+  let text;
+  let exportedAt = null;
   try {
     $('progress').textContent = 'Reading file…';
     $('progress').className = '';
-    const text = await readFileAsText(f);
-    parsed = JSON.parse(text);
+    text = await readFileAsText(f);
+    const parsed = JSON.parse(text);
+    if (!parsed || !Array.isArray(parsed.conversations)) {
+      throw new Error('Not a chatgpt-export JSON (missing conversations[])');
+    }
+    exportedAt = parsed.exported_at || null;
+    log(`Validated: ${parsed.conversations.length} conversations, ${(f.size/1024/1024).toFixed(1)} MB`);
   } catch (e) {
     $('progress').textContent = `Invalid JSON: ${e.message}`;
     $('progress').className = 'error';
     return;
   }
 
-  if (!parsed || !Array.isArray(parsed.conversations)) {
-    $('progress').textContent = 'File is not a chatgpt-export JSON (missing conversations[]).';
+  // Stash the raw text in chrome.storage.local — avoids the 64 MB sendMessage IPC cap.
+  // unlimitedStorage permission lets this scale to multi-GB source files.
+  try {
+    $('progress').textContent = 'Staging source in extension storage…';
+    await chrome.storage.local.set({
+      [ATTACH_SOURCE_KEY]: text,
+      [ATTACH_META_KEY]: { exportedAt, fileName: f.name, bytes: f.size, stagedAt: new Date().toISOString() },
+    });
+    log(`Staged ${(f.size/1024/1024).toFixed(1)} MB to chrome.storage.local`);
+  } catch (e) {
+    $('progress').textContent = `Storage write failed: ${e.message}`;
     $('progress').className = 'error';
     return;
   }
 
   const options = {
     _attachmentsOnly: true,
-    _sourceExportedAt: parsed.exported_at || null,
-    _sourceExport: parsed,
+    _sourceExportedAt: exportedAt,
+    _sourceKey: ATTACH_SOURCE_KEY,
+    _sourceMetaKey: ATTACH_META_KEY,
   };
 
   const tab = await injectAndGetTab();
