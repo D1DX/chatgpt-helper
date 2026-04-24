@@ -215,7 +215,9 @@ function renderCheckpointBanner(cp) {
     $('cp-title').textContent = label;
     $('cp-summary').innerHTML =
       `<strong>${cp.convs}</strong> convs, <strong>${cp.files}</strong> files fetched` +
-      (cp.failed ? ` · ${cp.failed} failed` : '') +
+      (cp.skipped ? ` · ${cp.skipped} 404` : '') +
+      (cp.abandoned ? ` · ${cp.abandoned} abandoned` : '') +
+      (cp.failed ? ` · ${cp.failed} transient` : '') +
       `<br>Last update: ${when}`;
   } else if (LEGACY_MODES.has(cp.mode)) {
     legacy.classList.add('active');
@@ -509,7 +511,7 @@ $('legacy-migrate-btn').addEventListener('click', async () => {
         log(msg);
         return;
       }
-      const summary = `Migrated — ${response.files} fetched, ${response.failed} failed (will retry), ${response.remaining} remaining of ${response.fileTargets} total`;
+      const summary = `Migrated — ${response.files} fetched, ${response.failed} failed (will retry), ${response.abandoned || 0} abandoned, ${response.remaining} remaining of ${response.fileTargets} total`;
       log(summary);
       $('progress').textContent = `${summary}. Click Resume to continue.`;
       $('progress').className = '';

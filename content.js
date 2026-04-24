@@ -465,6 +465,7 @@ if (!window.__chatgptExportLoaded) {
       fetchedFiles: legacy.fetchedFiles || {},
       skipped: legacy.skipped || [],
       failed: legacy.failed || [],
+      abandoned: [],        // v3.2.0 didn't have this bucket — failures start fresh
       earlyAttempts: 0,     // reset 404 early-abort counters — fresh window on resume
       earlyFails: 0,
       paused: true,         // land paused so user explicitly clicks Resume
@@ -481,8 +482,9 @@ if (!window.__chatgptExportLoaded) {
       files: Object.keys(unified.fetchedFiles).length,
       skipped: unified.skipped.length,
       failed: unified.failed.length,
+      abandoned: unified.abandoned.length,
       fileTargets: unified.fileTargets.length,
-      remaining: unified.fileTargets.length - Object.keys(unified.fetchedFiles).length - unified.skipped.length,
+      remaining: unified.fileTargets.length - Object.keys(unified.fetchedFiles).length - unified.skipped.length - unified.abandoned.length,
     };
   }
 
@@ -679,6 +681,7 @@ if (!window.__chatgptExportLoaded) {
           fetchedFiles: {},
           skipped: [],
           failed: [],
+          abandoned: [],
           earlyAttempts: 0,
           earlyFails: 0,
           paused: false,
@@ -706,7 +709,9 @@ if (!window.__chatgptExportLoaded) {
                 checkAbort();
                 const f = files[j];
                 const key = `${id}:${j}`;
-                if (cp.fetchedFiles[key] || (cp.skipped || []).some((s) => s.key === key)) continue;
+                if (cp.fetchedFiles[key]
+                    || (cp.skipped || []).some((s) => s.key === key)
+                    || (cp.abandoned || []).some((a) => a.key === key)) continue;
                 await fetchOneFile(cp, key, { convId: id, fileIndex: j, file: f, convTitle: data.title || '' }, auth);
               }
             }
@@ -729,8 +734,10 @@ if (!window.__chatgptExportLoaded) {
           checkAbort();
           const t = cp.fileTargets[i];
           const key = `${t.convId}:${t.fileIndex}`;
-          if (cp.fetchedFiles[key] || (cp.skipped || []).some((s) => s.key === key)) continue;
-          const doneCount = Object.keys(cp.fetchedFiles).length + (cp.skipped || []).length;
+          if (cp.fetchedFiles[key]
+              || (cp.skipped || []).some((s) => s.key === key)
+              || (cp.abandoned || []).some((a) => a.key === key)) continue;
+          const doneCount = Object.keys(cp.fetchedFiles).length + (cp.skipped || []).length + (cp.abandoned || []).length;
           const pct = 15 + Math.round(((doneCount + 1) / total) * 75);
           progress(`[${doneCount + 1}/${total}] ${t.convId.slice(0, 8)}… ${t.file?.name || ''}`.trim(), pct);
           await fetchOneFile(cp, key, t, auth);
@@ -750,8 +757,9 @@ if (!window.__chatgptExportLoaded) {
       const convs = Object.keys(cp.fetchedConvs).length + (config.source.kind === 'file' ? Object.keys(cp.sourceConvs || {}).length : 0);
       const files = Object.keys(cp.fetchedFiles).length;
       const skipped = (cp.skipped || []).length;
+      const abandoned = (cp.abandoned || []).length;
       const failed = (cp.failed || []).length;
-      done(`Done — ${convs} convs, ${files} files${skipped ? `, ${skipped} skipped (404)` : ''}${failed ? `, ${failed} failed` : ''}`);
+      done(`Done — ${convs} convs, ${files} files${skipped ? `, ${skipped} skipped (404)` : ''}${abandoned ? `, ${abandoned} abandoned` : ''}${failed ? `, ${failed} failed (transient)` : ''}`);
       D('========== runUnified END ==========');
     } catch (e) {
       if (e.message === 'Paused by user') {
@@ -769,24 +777,51 @@ if (!window.__chatgptExportLoaded) {
     }
   }
 
-  // --- One-file fetch with early-abort guard ---
+  // --- One-file fetch with early-abort guard + bounded retry + abandoned bucket ---
+  // Retry policy: 2 attempts max per file per Resume.
+  //   - 404 on either attempt → push to cp.skipped (no retry, session-dead URL)
+  //   - non-404/non-429 on first attempt → wait RETRY_DELAY_MS, try once more
+  //   - still failing after retry → push to cp.abandoned (permanently skipped on future Resumes)
+  //   - 429 handling lives inside fetchAttachmentDetailed (internal exponential backoff)
+  const RETRY_DELAY_MS = 2000;
+
+  async function callFetch(target, auth) {
+    try { return await fetchAttachmentDetailed(target.file.url, auth); }
+    catch (e) {
+      if (e.message === 'Cancelled by user' || e.message === 'Paused by user') throw e;
+      return { ok: false, status: 0, reason: e.message };
+    }
+  }
+
+  function pushDedup(list, key, entry) {
+    const idx = list.findIndex((e) => e.key === key);
+    if (idx >= 0) list.splice(idx, 1);
+    list.push(entry);
+  }
+
   async function fetchOneFile(cp, key, target, auth) {
     if (!target.file?.url) {
       cp.fetchedFiles[key] = { ...target.file, data: null, _note: 'no-url-in-source' };
       return;
     }
-    let result;
-    try { result = await fetchAttachmentDetailed(target.file.url, auth); }
-    catch (e) {
-      if (e.message === 'Cancelled by user' || e.message === 'Paused by user') throw e;
-      result = { ok: false, status: 0, reason: e.message };
-    }
+
+    cp.failed = cp.failed || [];
+    cp.skipped = cp.skipped || [];
+    cp.abandoned = cp.abandoned || [];
+
+    // Attempt 1
+    let result = await callFetch(target, auth);
+
     if (result.ok) {
       cp.fetchedFiles[key] = { ...target.file, data: result.data };
       cp.earlyAttempts = 0;
       cp.earlyFails = 0;
+      // Clear any prior failure entry
+      const idx = cp.failed.findIndex((e) => e.key === key);
+      if (idx >= 0) cp.failed.splice(idx, 1);
       return;
     }
+
     if (result.status === 404) {
       cp.earlyAttempts++;
       cp.earlyFails++;
@@ -794,13 +829,50 @@ if (!window.__chatgptExportLoaded) {
         await saveCheckpoint(cp);
         throw new Error(`Aborted: first ${cp.earlyAttempts} attempts all returned 404. Session expired or URL format changed — re-login to chatgpt.com and retry.`);
       }
-      cp.skipped = cp.skipped || [];
-      cp.skipped.push({ key, convId: target.convId, name: target.file?.name || null, url: target.file?.url, status: 404 });
-    } else {
-      cp.earlyAttempts++;
-      cp.failed = cp.failed || [];
-      cp.failed.push({ key, convId: target.convId, name: target.file?.name || null, url: target.file?.url, status: result.status, reason: result.reason });
+      pushDedup(cp.skipped, key, { key, convId: target.convId, name: target.file?.name || null, url: target.file?.url, status: 404 });
+      return;
     }
+
+    // Non-404, non-429 failure — record as transient and retry once after a short delay
+    const firstFailedAt = new Date().toISOString();
+    pushDedup(cp.failed, key, {
+      key, convId: target.convId, name: target.file?.name || null, url: target.file?.url,
+      status: result.status, reason: result.reason, attempts: 1, firstFailedAt,
+    });
+    await saveCheckpoint(cp);
+
+    await sleep(RETRY_DELAY_MS);
+    checkAbort();
+
+    // Attempt 2
+    result = await callFetch(target, auth);
+
+    if (result.ok) {
+      cp.fetchedFiles[key] = { ...target.file, data: result.data };
+      cp.earlyAttempts = 0;
+      cp.earlyFails = 0;
+      const idx = cp.failed.findIndex((e) => e.key === key);
+      if (idx >= 0) cp.failed.splice(idx, 1);
+      return;
+    }
+
+    if (result.status === 404) {
+      // 404 on retry → dead URL, push to skipped (don't double-count into earlyAttempts — that's retry noise)
+      pushDedup(cp.skipped, key, { key, convId: target.convId, name: target.file?.name || null, url: target.file?.url, status: 404 });
+      const idx = cp.failed.findIndex((e) => e.key === key);
+      if (idx >= 0) cp.failed.splice(idx, 1);
+      return;
+    }
+
+    // Give up — permanently abandoned
+    cp.earlyAttempts++;
+    pushDedup(cp.abandoned, key, {
+      key, convId: target.convId, name: target.file?.name || null, url: target.file?.url,
+      attempts: 2, lastStatus: result.status, lastReason: result.reason,
+      firstFailedAt, abandonedAt: new Date().toISOString(),
+    });
+    const idx = cp.failed.findIndex((e) => e.key === key);
+    if (idx >= 0) cp.failed.splice(idx, 1);
   }
 
   // --- Build the conversations payload in legacy v3.x schema ---
@@ -858,6 +930,7 @@ if (!window.__chatgptExportLoaded) {
         convs: (config.source.kind === 'file' ? Object.keys(cp.sourceConvs || {}).length : Object.keys(cp.fetchedConvs || {}).length),
         attachments: Object.keys(cp.fetchedFiles || {}).length,
         skipped_404: (cp.skipped || []).length,
+        abandoned: (cp.abandoned || []).length,
         failed: (cp.failed || []).length,
         ...(partial ? { partial: true } : {}),
       },
@@ -919,14 +992,16 @@ if (!window.__chatgptExportLoaded) {
           source_exported_at: cp.sourceMeta?.exportedAt || null,
           generated_at: new Date().toISOString(),
           stats: {
-            plan: (config.source.kind === 'file' ? (cp.fileTargets || []).length : Object.keys(cp.fetchedFiles).length + (cp.skipped || []).length + (cp.failed || []).length),
+            plan: (config.source.kind === 'file' ? (cp.fileTargets || []).length : Object.keys(cp.fetchedFiles).length + (cp.skipped || []).length + (cp.abandoned || []).length + (cp.failed || []).length),
             fetched: Object.keys(cp.fetchedFiles).length,
             skipped_404: (cp.skipped || []).length,
+            abandoned: (cp.abandoned || []).length,
             failed: (cp.failed || []).length,
           },
           volume_target_bytes: VOLUME_TARGET_BYTES,
           attachments: {},
           skipped_404: cp.skipped || [],
+          abandoned: cp.abandoned || [],
           failed: cp.failed || [],
         };
 
@@ -1125,6 +1200,8 @@ if (!window.__chatgptExportLoaded) {
             total,
             convs,
             files,
+            skipped: (cp.skipped || []).length,
+            abandoned: (cp.abandoned || []).length,
             failed: (cp.failed || []).length,
             config: cp.config || null,
           },
