@@ -71,19 +71,25 @@
     }
     .row { display: flex; gap: 8px; }
     .row .field { flex: 1; }
-    .checkbox-field {
+    .checkbox-field, .radio-field {
       display: flex;
       align-items: center;
       gap: 6px;
+      margin-bottom: 6px;
+    }
+    .checkbox-field input, .radio-field input { width: auto; margin: 0; }
+    .checkbox-field label, .radio-field label { margin: 0; font-size: 12px; cursor: pointer; }
+    .radio-group, .checkbox-group {
+      display: flex;
+      gap: 10px;
       margin-bottom: 10px;
     }
-    .checkbox-field input[type="checkbox"] { width: auto; margin: 0; }
-    .checkbox-field label { margin: 0; font-size: 12px; }
     .hint {
       font-size: 10px;
       color: #999;
       margin-top: 2px;
     }
+    .hint.warn { color: #c0392b; }
 
     /* Buttons */
     .actions { margin-top: 4px; }
@@ -109,36 +115,33 @@
     .btn-danger { background: #c0392b; }
     .btn-danger:hover:not(:disabled) { background: #922b21; }
 
-    /* Checkpoint banner */
-    #checkpoint-banner {
+    /* Checkpoint banners */
+    .banner {
       display: none;
       margin-bottom: 12px;
       padding: 8px 10px;
-      background: #fff8e1;
-      border: 1px solid #ffcc80;
       border-radius: 4px;
       font-size: 11px;
       line-height: 1.5;
-      color: #5d4037;
     }
-    #checkpoint-banner.active { display: block; }
-    #checkpoint-banner .cp-title {
-      font-weight: 600;
-      color: #e67e22;
-      margin-bottom: 4px;
-    }
-    #checkpoint-banner .cp-actions {
+    .banner.active { display: block; }
+    .banner .b-title { font-weight: 600; margin-bottom: 4px; }
+    .banner .b-actions {
       display: flex;
       gap: 4px;
       margin-top: 6px;
     }
-    #checkpoint-banner .cp-actions button {
+    .banner .b-actions button {
       padding: 5px 6px;
       font-size: 10px;
       font-weight: 600;
     }
+    #checkpoint-banner { background: #fff8e1; border: 1px solid #ffcc80; color: #5d4037; }
+    #checkpoint-banner .b-title { color: #e67e22; }
+    #legacy-banner { background: #fdecea; border: 1px solid #f5c6cb; color: #721c24; }
+    #legacy-banner .b-title { color: #c0392b; }
 
-    /* Retry-by-ID textarea */
+    /* Textarea */
     textarea {
       width: 100%;
       padding: 6px 8px;
@@ -148,7 +151,16 @@
       background: #fff;
       font-family: 'SF Mono', Menlo, monospace;
       resize: vertical;
-      min-height: 60px;
+      min-height: 70px;
+    }
+
+    /* Source panel */
+    .source-panel { margin-bottom: 10px; }
+    .matrix-hint {
+      font-size: 10px;
+      color: #c0392b;
+      margin-top: 4px;
+      min-height: 13px;
     }
 
     /* Progress */
@@ -215,16 +227,26 @@
     .footer a { color: #005490; text-decoration: none; }
 
     .hidden { display: none !important; }
+    fieldset { border: none; }
   </style>
 </head>
 <body>
-  <h1>ChatGPT Helper <span class="badge">D1DX</span></h1>
+  <h1>ChatGPT Helper <span class="badge">D1DX v4</span></h1>
 
-  <!-- Checkpoint banner (resumable run) -->
-  <div id="checkpoint-banner">
-    <div class="cp-title" id="cp-title">Checkpoint found</div>
+  <!-- Legacy v3.x checkpoint banner (shown only if a pre-v4 checkpoint exists) -->
+  <div id="legacy-banner" class="banner">
+    <div class="b-title">Legacy checkpoint — cannot resume</div>
+    <div id="legacy-summary"></div>
+    <div class="b-actions">
+      <button id="legacy-discard-btn" class="btn-danger">Discard</button>
+    </div>
+  </div>
+
+  <!-- Unified v4 checkpoint banner (resumable) -->
+  <div id="checkpoint-banner" class="banner">
+    <div class="b-title" id="cp-title">Checkpoint found</div>
     <div id="cp-summary"></div>
-    <div class="cp-actions">
+    <div class="b-actions">
       <button id="cp-resume-btn" class="btn-success">Resume</button>
       <button id="cp-download-btn" class="btn-secondary">Download partial</button>
       <button id="cp-discard-btn" class="btn-danger">Discard</button>
@@ -233,59 +255,122 @@
 
   <!-- Tabs -->
   <div class="tabs">
-    <div class="tab active" data-tab="export">Export</div>
-    <div class="tab" data-tab="retry">Retry IDs</div>
-    <div class="tab" data-tab="attachments">Attachments</div>
-    <div class="tab" data-tab="memories">Memories</div>
+    <div class="tab active" data-tab="conversations">Export Conversations</div>
+    <div class="tab" data-tab="memories">Export Memories</div>
   </div>
 
-  <!-- Shared filters (Export only) -->
-  <div id="export-filters">
-    <div class="field" id="source-field">
+  <!-- ============ Export Conversations tab ============ -->
+  <div id="conversations-tab">
+    <!-- Source radio -->
+    <div class="field">
       <label>Source</label>
-      <select id="source">
-        <option value="active">Active</option>
-        <option value="archived">Archived</option>
-        <option value="both" selected>Both</option>
-      </select>
-    </div>
-
-    <div class="field" id="project-field">
-      <label>Project</label>
-      <select id="project">
-        <option value="all">All conversations</option>
-        <option value="inbox">Inbox (no project)</option>
-      </select>
-      <div id="project-loading" class="hint">Loading projects…</div>
-    </div>
-
-    <div class="row">
-      <div class="field">
-        <label>From</label>
-        <input type="date" id="date-from">
-      </div>
-      <div class="field">
-        <label>To</label>
-        <input type="date" id="date-to">
+      <div class="radio-group">
+        <div class="radio-field">
+          <input type="radio" name="source-kind" id="src-fresh" value="fresh" checked>
+          <label for="src-fresh">Fresh</label>
+        </div>
+        <div class="radio-field">
+          <input type="radio" name="source-kind" id="src-byids" value="byids">
+          <label for="src-byids">By IDs</label>
+        </div>
+        <div class="radio-field">
+          <input type="radio" name="source-kind" id="src-file" value="file">
+          <label for="src-file">From file</label>
+        </div>
       </div>
     </div>
 
+    <!-- Fresh panel -->
+    <div id="fresh-panel" class="source-panel">
+      <div class="field">
+        <label>Listing</label>
+        <select id="source">
+          <option value="active">Active</option>
+          <option value="archived">Archived</option>
+          <option value="both" selected>Both</option>
+        </select>
+      </div>
+      <div class="field" id="project-field">
+        <label>Project</label>
+        <select id="project">
+          <option value="all">All conversations</option>
+          <option value="inbox">Inbox (no project)</option>
+        </select>
+        <div id="project-loading" class="hint">Loading projects…</div>
+      </div>
+      <div class="row">
+        <div class="field"><label>From</label><input type="date" id="date-from"></div>
+        <div class="field"><label>To</label><input type="date" id="date-to"></div>
+      </div>
+      <div class="field">
+        <label>Keyword</label>
+        <input type="text" id="keyword" placeholder="Filter by title">
+      </div>
+      <div class="checkbox-field">
+        <input type="checkbox" id="export-all" checked>
+        <label for="export-all">All matching conversations</label>
+      </div>
+      <div class="field hidden" id="limit-field">
+        <label>Max conversations</label>
+        <input type="number" id="limit" value="10" min="1">
+      </div>
+    </div>
+
+    <!-- ByIds panel -->
+    <div id="byids-panel" class="source-panel hidden">
+      <div class="field">
+        <label>Conversation IDs (one per line; lines starting with # are comments)</label>
+        <textarea id="byids-text" placeholder="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee&#10;11111111-2222-3333-4444-555555555555&#10;# comment line is ignored"></textarea>
+        <div class="hint" id="byids-count">0 IDs parsed</div>
+      </div>
+    </div>
+
+    <!-- File panel -->
+    <div id="file-panel" class="source-panel hidden">
+      <div class="field">
+        <label>Existing export JSON</label>
+        <input type="file" id="file-input" accept=".json,application/json">
+        <div class="hint" id="file-info">Select a previously exported chatgpt-export-*.json</div>
+      </div>
+      <div class="hint">
+        File source is Attachments-only — conversations come verbatim from the file.
+        Engine walks each conversation for <code>asset_pointer</code> + <code>attachments[]</code>
+        and fetches the binaries.
+      </div>
+    </div>
+
+    <!-- Fetch checkboxes -->
     <div class="field">
-      <label>Keyword</label>
-      <input type="text" id="keyword" placeholder="Filter by title">
+      <label>Fetch</label>
+      <div class="checkbox-group">
+        <div class="checkbox-field">
+          <input type="checkbox" id="fetch-conv" checked>
+          <label for="fetch-conv">Conversations</label>
+        </div>
+        <div class="checkbox-field">
+          <input type="checkbox" id="fetch-att">
+          <label for="fetch-att">Attachments</label>
+        </div>
+      </div>
     </div>
 
-    <div class="checkbox-field">
-      <input type="checkbox" id="export-all" checked>
-      <label for="export-all">All matching conversations</label>
-    </div>
-
-    <div class="field hidden" id="limit-field">
-      <label>Max conversations</label>
-      <input type="number" id="limit" value="10" min="1">
-    </div>
-
+    <!-- Output -->
     <div class="field">
+      <label>Output</label>
+      <div class="radio-group">
+        <div class="radio-field">
+          <input type="radio" name="output-kind" id="out-json" value="json" checked>
+          <label for="out-json">JSON</label>
+        </div>
+        <div class="radio-field">
+          <input type="radio" name="output-kind" id="out-zip" value="zip">
+          <label for="out-zip">ZIP (auto-split 100 MB)</label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Format dropdown (JSON output only) -->
+    <div class="field" id="format-field">
       <label>Format</label>
       <select id="format">
         <option value="json">JSON — full backup</option>
@@ -297,54 +382,23 @@
       </select>
     </div>
 
-    <div class="checkbox-field" id="attachments-field">
-      <input type="checkbox" id="attachments">
-      <label for="attachments">Include attachments &amp; images</label>
+    <!-- Tag (optional) -->
+    <div class="field">
+      <label>Tag <span class="hint" style="display:inline">(optional — auto-derived when empty)</span></label>
+      <input type="text" id="tag" placeholder="e.g. weekly-backup">
+    </div>
+
+    <div class="matrix-hint" id="matrix-hint"></div>
+
+    <div class="actions">
+      <button id="run-btn" class="btn-primary">Run</button>
+      <button id="pause-btn" class="btn-secondary hidden" style="margin-top: 6px;">Pause (keep progress)</button>
+      <button id="cancel-btn" class="btn-warning hidden" style="margin-top: 6px;">Cancel (discard progress)</button>
     </div>
   </div>
 
-  <!-- Retry-by-ID panel -->
-  <div id="retry-panel" class="hidden">
-    <div class="field">
-      <label>Conversation IDs to fetch</label>
-      <textarea id="retry-ids" placeholder='Paste JSON array or newline-separated UUIDs&#10;e.g.:&#10;aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee&#10;11111111-2222-3333-4444-555555555555'></textarea>
-      <div class="hint" id="retry-ids-count">0 IDs parsed</div>
-    </div>
-    <div class="field">
-      <label>Format</label>
-      <select id="retry-format">
-        <option value="json">JSON — full backup</option>
-        <option value="markdown">Markdown</option>
-        <option value="jsonl">JSONL</option>
-        <option value="html">HTML</option>
-        <option value="csv">CSV</option>
-        <option value="txt">Plain text</option>
-      </select>
-    </div>
-    <div class="checkbox-field">
-      <input type="checkbox" id="retry-attachments">
-      <label for="retry-attachments">Include attachments (JSON only)</label>
-    </div>
-  </div>
-
-  <!-- Attachments-only panel (fetch attachments from an existing exported JSON) -->
-  <div id="attachments-panel" class="hidden">
-    <div class="field">
-      <label>Existing export JSON</label>
-      <input type="file" id="attachments-file" accept=".json,application/json">
-      <div class="hint" id="attachments-file-info">Select a previously exported chatgpt-export-*.json</div>
-    </div>
-    <div class="hint">
-      Reads the file locally, walks every conversation for <code>asset_pointer</code> + <code>attachments[]</code>,
-      fetches the binaries, and downloads ZIP volumes:
-      <code>-vol01.zip</code>, <code>-vol02.zip</code>, … (~100 MB each),
-      plus a <code>-metadata.zip</code> containing <code>conversations.json</code> verbatim and
-      <code>attachments-index.json</code>. Aborts if the first &gt;5 fetches all return 404.
-    </div>
-  </div>
-
-  <!-- Memories options -->
-  <div id="memories-options" class="hidden">
+  <!-- ============ Export Memories tab ============ -->
+  <div id="memories-tab" class="hidden">
     <div class="field">
       <label>Format</label>
       <select id="memories-format">
@@ -353,16 +407,9 @@
         <option value="txt">Plain text</option>
       </select>
     </div>
-  </div>
-
-  <!-- Action buttons -->
-  <div class="actions">
-    <button id="export-btn" class="btn-primary">Export Conversations</button>
-    <button id="retry-btn" class="btn-primary hidden">Fetch IDs</button>
-    <button id="attachments-btn" class="btn-primary hidden">Fetch Attachments</button>
-    <button id="memories-btn" class="btn-primary hidden">Export Memories</button>
-    <button id="pause-btn" class="btn-secondary hidden" style="margin-top: 6px;">Pause (keep progress)</button>
-    <button id="cancel-btn" class="btn-warning hidden" style="margin-top: 6px;">Cancel (discard progress)</button>
+    <div class="actions">
+      <button id="memories-btn" class="btn-primary">Export Memories</button>
+    </div>
   </div>
 
   <div id="progress"></div>
