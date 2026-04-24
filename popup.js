@@ -213,12 +213,22 @@ function renderCheckpointBanner(cp) {
     const when = cp.lastUpdate ? new Date(cp.lastUpdate).toLocaleString() : '';
     const label = cp.paused ? 'Paused run' : 'Checkpoint found';
     $('cp-title').textContent = label;
-    $('cp-summary').innerHTML =
-      `<strong>${cp.convs}</strong> convs, <strong>${cp.files}</strong> files fetched` +
-      (cp.skipped ? ` · ${cp.skipped} 404` : '') +
-      (cp.abandoned ? ` · ${cp.abandoned} abandoned` : '') +
-      (cp.failed ? ` · ${cp.failed} transient` : '') +
-      `<br>Last update: ${when}`;
+    const fetched = cp.files || 0;
+    const skipped = cp.skipped || 0;
+    const abandoned = cp.abandoned || 0;
+    const inflight = cp.failed || 0;
+    const total = cp.total || 0;
+    const processed = fetched + skipped + abandoned + inflight;
+    const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+    const primary = `<strong>${processed.toLocaleString()}</strong> / ${total.toLocaleString()} processed (${pct}%)`;
+    const breakdown = [
+      `${fetched} fetched`,
+      abandoned ? `${abandoned} abandoned` : null,
+      inflight ? `${inflight} in-flight` : null,
+      skipped ? `${skipped} skipped (404)` : null,
+    ].filter(Boolean).join(' · ');
+    const convLine = cp.convs ? `<br>${cp.convs} convs fetched` : '';
+    $('cp-summary').innerHTML = `${primary}${convLine}<br>${breakdown}<br>Last update: ${when}`;
   } else if (LEGACY_MODES.has(cp.mode)) {
     legacy.classList.add('active');
     const canMigrate = cp.mode === 'attachments-only' && cp.files > 0;
