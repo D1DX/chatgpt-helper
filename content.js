@@ -381,6 +381,103 @@ if (!window.__chatgptExportLoaded) {
     catch (e) { D('clearStagedSource:', e.message); }
   }
 
+  // --- Legacy v3.2.0 checkpoint migration ---
+  // Converts a `mode: 'attachments-only'` checkpoint into a v4 `mode: 'unified'`
+  // checkpoint in place, preserving every fetched dataURL + skipped/failed tracking
+  // so a partially-complete v3 run can resume under v4 without re-fetching.
+  // Writes a backup to `export_checkpoint_legacy_backup` before overwriting.
+  async function migrateLegacyCheckpoint() {
+    const r = await chrome.storage.local.get([
+      CHECKPOINT_KEY, ATTACH_SOURCE_KEY_DEFAULT, ATTACH_META_KEY_DEFAULT,
+    ]);
+    const legacy = r[CHECKPOINT_KEY];
+    if (!legacy) throw new Error('No checkpoint to migrate');
+    if (legacy.mode === 'unified') throw new Error('Checkpoint already in v4 shape');
+    if (legacy.mode !== 'attachments-only') {
+      throw new Error(`Migration only supported for 'attachments-only' mode (found: ${legacy.mode}). Discard and start a fresh v4 run.`);
+    }
+
+    const sourceText = r[ATTACH_SOURCE_KEY_DEFAULT];
+    const sourceMeta = r[ATTACH_META_KEY_DEFAULT] || {};
+    if (!sourceText) throw new Error('Staged source JSON missing — cannot rebuild file plan. Re-pick the source file first.');
+    let parsed;
+    try { parsed = JSON.parse(sourceText); }
+    catch (e) { throw new Error(`Staged source parse failed: ${e.message}`); }
+    if (!parsed || !Array.isArray(parsed.conversations)) {
+      throw new Error('Staged source JSON missing conversations[]');
+    }
+
+    // Backup first — lets the user roll back via one console line if anything looks wrong
+    await chrome.storage.local.set({ export_checkpoint_legacy_backup: legacy });
+
+    // Rebuild sourceConvs + fileTargets from the staged source JSON (same logic as buildPlan 'file' kind)
+    const sourceConvs = {};
+    const fileTargets = [];
+    for (const conv of parsed.conversations) {
+      const convId = conv && (conv.conversation_id || conv.id);
+      if (!convId) continue;
+      sourceConvs[convId] = conv;
+      const files = extractFileRefs(conv);
+      for (let i = 0; i < files.length; i++) {
+        fileTargets.push({ convId, fileIndex: i, file: files[i], convTitle: conv.title || '' });
+      }
+    }
+
+    const exportedAt = parsed.exported_at || sourceMeta.exportedAt || null;
+    const config = {
+      source: {
+        kind: 'file',
+        sourceKey: ATTACH_SOURCE_KEY_DEFAULT,
+        sourceMetaKey: ATTACH_META_KEY_DEFAULT,
+        exportedAt,
+        ref: sourceMeta.fileName || null,
+      },
+      fetch: { conversations: false, attachments: true },
+      output: { kind: 'zip', format: 'json' },
+      tag: null,
+    };
+
+    const unified = {
+      runId: legacy.runId || Date.now().toString(),
+      mode: 'unified',
+      config,
+      startedAt: legacy.startedAt || new Date().toISOString(),
+      account: legacy.account || null,
+      convIds: [],
+      convMeta: {},
+      fileTargets,
+      sourceConvs,
+      sourceMeta: {
+        exportedAt,
+        unified: parsed.unified === true,
+        ref: sourceMeta.fileName || null,
+        bytes: sourceMeta.bytes || null,
+      },
+      fetchedConvs: {},
+      fetchedFiles: legacy.fetchedFiles || {},
+      skipped: legacy.skipped || [],
+      failed: legacy.failed || [],
+      earlyAttempts: 0,     // reset 404 early-abort counters — fresh window on resume
+      earlyFails: 0,
+      paused: true,         // land paused so user explicitly clicks Resume
+      migratedFrom: {
+        mode: legacy.mode,
+        legacyRunId: legacy.runId || null,
+        migratedAt: new Date().toISOString(),
+      },
+    };
+    await saveCheckpoint(unified);
+
+    return {
+      ok: true,
+      files: Object.keys(unified.fetchedFiles).length,
+      skipped: unified.skipped.length,
+      failed: unified.failed.length,
+      fileTargets: unified.fileTargets.length,
+      remaining: unified.fileTargets.length - Object.keys(unified.fetchedFiles).length - unified.skipped.length,
+    };
+  }
+
   // --- Download primitives (all take a path with optional "folder/" prefix) ---
   function triggerBlobDownload(blob, path) {
     const url = URL.createObjectURL(blob);
@@ -1025,6 +1122,13 @@ if (!window.__chatgptExportLoaded) {
           },
         });
       });
+      return true;
+    }
+
+    if (msg.action === 'migrate-legacy') {
+      migrateLegacyCheckpoint()
+        .then((result) => sendResponse(result))
+        .catch((e) => { D('migrate-legacy error:', e.message); sendResponse({ ok: false, reason: e.message }); });
       return true;
     }
 

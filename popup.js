@@ -167,7 +167,7 @@ $('file-input').addEventListener('change', async () => {
 
 // --- UI state: running vs idle ---
 let isRunning = false;
-const ACTION_BTNS = ['run-btn', 'memories-btn', 'cp-resume-btn', 'cp-download-btn', 'cp-discard-btn', 'legacy-discard-btn'];
+const ACTION_BTNS = ['run-btn', 'memories-btn', 'cp-resume-btn', 'cp-download-btn', 'cp-discard-btn', 'legacy-migrate-btn', 'legacy-discard-btn'];
 function setRunningUI(running) {
   isRunning = running;
   ACTION_BTNS.forEach((id) => { const el = $(id); if (el) el.disabled = running; });
@@ -219,8 +219,20 @@ function renderCheckpointBanner(cp) {
       `<br>Last update: ${when}`;
   } else if (LEGACY_MODES.has(cp.mode)) {
     legacy.classList.add('active');
-    $('legacy-summary').innerHTML =
-      `Found a v3.x checkpoint (mode: <code>${cp.mode}</code>). v4 cannot resume legacy runs — discard to continue.`;
+    const canMigrate = cp.mode === 'attachments-only' && cp.files > 0;
+    const remaining = Math.max(0, (cp.total || 0) - (cp.files || 0));
+    let summary = `Found a v3.x checkpoint (mode: <code>${cp.mode}</code>).`;
+    if (cp.mode === 'attachments-only') {
+      summary += `<br><strong>${cp.files}</strong> attachments fetched, ${cp.failed || 0} failed, <strong>${remaining}</strong> remaining of ${cp.total || '?'}.`;
+      summary += canMigrate
+        ? '<br>"Migrate &amp; Resume" converts to v4 shape and preserves all fetched files.'
+        : '<br>Nothing to migrate — discard to continue.';
+    } else {
+      summary += '<br>v4 cannot resume this legacy mode — discard to continue.';
+    }
+    $('legacy-summary').innerHTML = summary;
+    // Hide migrate button when nothing to migrate
+    $('legacy-migrate-btn').classList.toggle('hidden', !canMigrate);
   }
 }
 
@@ -473,6 +485,43 @@ $('cp-discard-btn').addEventListener('click', async () => {
 });
 
 // --- Legacy checkpoint banner actions ---
+$('legacy-migrate-btn').addEventListener('click', async () => {
+  try {
+    const tab = await injectAndGetTab();
+    if (!tab) { $('progress').textContent = 'Open chatgpt.com first'; $('progress').className = 'error'; return; }
+    $('progress').textContent = 'Migrating legacy checkpoint…';
+    $('progress').className = '';
+    $('progress-bar-container').style.display = 'block';
+    $('progress-bar').style.width = '0%';
+    log('Migration started — rebuilding plan from staged source JSON');
+    chrome.tabs.sendMessage(tab.id, { action: 'migrate-legacy' }, async (response) => {
+      if (chrome.runtime.lastError || !response) {
+        const msg = 'Migration failed: ' + (chrome.runtime.lastError?.message || 'no response');
+        $('progress').textContent = msg;
+        $('progress').className = 'error';
+        log(msg);
+        return;
+      }
+      if (!response.ok) {
+        const msg = 'Migration failed: ' + (response.reason || 'unknown');
+        $('progress').textContent = msg;
+        $('progress').className = 'error';
+        log(msg);
+        return;
+      }
+      const summary = `Migrated — ${response.files} fetched, ${response.failed} failed (will retry), ${response.remaining} remaining of ${response.fileTargets} total`;
+      log(summary);
+      $('progress').textContent = `${summary}. Click Resume to continue.`;
+      $('progress').className = '';
+      await refreshCheckpointBanner(tab);
+    });
+  } catch (e) {
+    $('progress').textContent = 'Migration failed: ' + e.message;
+    $('progress').className = 'error';
+    log('Migration exception: ' + e.message);
+  }
+});
+
 $('legacy-discard-btn').addEventListener('click', async () => {
   if (!confirm('Discard the legacy v3.x checkpoint and any staged source JSON?')) return;
   try {
