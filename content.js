@@ -1,21 +1,60 @@
-// ChatGPT Helper — content script
-// Runs on chatgpt.com, handles API calls and export logic.
+// ChatGPT Helper — content script (v4 unified engine)
+// Runs on chatgpt.com. One runUnified(config) engine covers fresh/byids/file sources
+// and conversation/attachment payloads; emits a run folder with run-manifest.json.
+// runExportMemories is preserved separately.
 
 // Guard against double-injection
 if (!window.__chatgptExportLoaded) {
   window.__chatgptExportLoaded = true;
 
+  // --- Constants ---
   const LIMIT = 100;
   const DELAY_INITIAL = 800;
   const DELAY_MAX = 60000;
   const CHECKPOINT_KEY = 'export_checkpoint';
+  const VOLUME_TARGET_BYTES = 100 * 1024 * 1024; // ~100 MB uncompressed per ZIP volume
+  const RUN_HISTORY_KEY = 'run_history';
+  const RUN_HISTORY_MAX = 20;
+  const ATTACH_SOURCE_KEY_DEFAULT = 'attach_source_v1';
+  const ATTACH_META_KEY_DEFAULT = 'attach_source_meta_v1';
+  const MANIFEST_VERSION = 1;
 
+  // --- State ---
   let delayMs = DELAY_INITIAL;
   let abortRequested = false;
   let pauseRequested = false;
   let running = false;
   let lastStatus = null;
-  let currentCheckpoint = null;  // in-memory mirror of chrome.storage.local[CHECKPOINT_KEY]
+  let currentCheckpoint = null;
+
+  // --- Logging + status ---
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const D = (...args) => console.log('[ChatGPT Helper]', ...args);
+
+  function setStatus(type, text, percent) {
+    lastStatus = { type, text, percent, ts: Date.now() };
+  }
+  function progress(text, percent) {
+    D('PROGRESS:', text, percent !== undefined ? `${percent}%` : '');
+    setStatus('progress', text, percent);
+    try { chrome.runtime.sendMessage({ type: 'progress', text, percent }); } catch {}
+  }
+  function done(text) {
+    D('DONE:', text);
+    running = false;
+    setStatus('done', text, 100);
+    try { chrome.runtime.sendMessage({ type: 'done', text }); } catch {}
+  }
+  function error(text) {
+    D('ERROR:', text);
+    running = false;
+    setStatus('error', text, undefined);
+    try { chrome.runtime.sendMessage({ type: 'error', text }); } catch {}
+  }
+  function checkAbort() {
+    if (abortRequested) throw new Error('Cancelled by user');
+    if (pauseRequested) throw new Error('Paused by user');
+  }
 
   // --- Checkpoint persistence ---
   async function loadCheckpoint() {
@@ -27,7 +66,6 @@ if (!window.__chatgptExportLoaded) {
       return null;
     }
   }
-
   async function saveCheckpoint(cp) {
     try {
       cp.lastUpdate = new Date().toISOString();
@@ -37,7 +75,6 @@ if (!window.__chatgptExportLoaded) {
       D('saveCheckpoint: error', e.message);
     }
   }
-
   async function clearCheckpoint() {
     try {
       await chrome.storage.local.remove(CHECKPOINT_KEY);
@@ -47,78 +84,14 @@ if (!window.__chatgptExportLoaded) {
     }
   }
 
-  function optionsMatch(a, b) {
-    if (!a || !b) return false;
-    // Mode guard: list-mode, retry-mode, and attachments-only options must not cross-match
-    const aIsRetry = Array.isArray(a._retryIds) && a._retryIds.length > 0;
-    const bIsRetry = Array.isArray(b._retryIds) && b._retryIds.length > 0;
-    const aIsAttOnly = !!a._attachmentsOnly;
-    const bIsAttOnly = !!b._attachmentsOnly;
-    if (aIsRetry !== bIsRetry) return false;
-    if (aIsAttOnly !== bIsAttOnly) return false;
-    if (aIsAttOnly) {
-      // Identity = exported_at of source file
-      return (a._sourceExportedAt ?? null) === (b._sourceExportedAt ?? null);
-    }
-    if (aIsRetry) {
-      // For retry mode, the ID list defines identity
-      if (a._retryIds.length !== b._retryIds.length) return false;
-      const as = new Set(a._retryIds);
-      for (const id of b._retryIds) if (!as.has(id)) return false;
-      return (a.format ?? null) === (b.format ?? null);
-    }
-    const keys = ['project', 'source', 'dateFrom', 'dateTo', 'keyword', 'limit', 'attachments', 'format'];
-    return keys.every((k) => (a[k] ?? null) === (b[k] ?? null));
-  }
-
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const D = (...args) => console.log('[ChatGPT Helper]', ...args);
-
-  function setStatus(type, text, percent) {
-    lastStatus = { type, text, percent, ts: Date.now() };
-  }
-
-  function progress(text, percent) {
-    D('PROGRESS:', text, percent !== undefined ? `${percent}%` : '');
-    setStatus('progress', text, percent);
-    try { chrome.runtime.sendMessage({ type: 'progress', text, percent }); } catch {}
-  }
-
-  function done(text) {
-    D('DONE:', text);
-    running = false;
-    setStatus('done', text, 100);
-    try { chrome.runtime.sendMessage({ type: 'done', text }); } catch {}
-  }
-
-  function error(text) {
-    D('ERROR:', text);
-    running = false;
-    setStatus('error', text, undefined);
-    try { chrome.runtime.sendMessage({ type: 'error', text }); } catch {}
-  }
-
-  function checkAbort() {
-    if (abortRequested) throw new Error('Cancelled by user');
-    if (pauseRequested) throw new Error('Paused by user');
-  }
-
+  // --- Auth + raw API ---
   async function getAuth() {
     D('getAuth: reading _account cookie...');
-    const acct = document.cookie
-      .split(';')
-      .map((c) => c.trim())
-      .find((c) => c.startsWith('_account='));
+    const acct = document.cookie.split(';').map((c) => c.trim()).find((c) => c.startsWith('_account='));
     const accountId = acct ? acct.split('=')[1] : null;
-    D('getAuth: accountId =', accountId);
-
-    D('getAuth: fetching /api/auth/session...');
     const res = await fetch('/api/auth/session', { credentials: 'include' });
-    D('getAuth: session response status =', res.status);
     const sess = await res.json();
     const token = sess.accessToken;
-    D('getAuth: token present =', !!token, ', length =', token?.length);
-
     if (!token) throw new Error('No access token — are you logged in?');
     return { token, accountId };
   }
@@ -129,7 +102,6 @@ if (!window.__chatgptExportLoaded) {
       attempt++;
       checkAbort();
       const fullUrl = `/backend-api${path}`;
-      D('API REQUEST:', fullUrl, attempt > 1 ? `(attempt ${attempt})` : '');
       const res = await fetch(fullUrl, {
         credentials: 'include',
         headers: {
@@ -137,290 +109,125 @@ if (!window.__chatgptExportLoaded) {
           ...(auth.accountId ? { 'chatgpt-account-id': auth.accountId } : {}),
         },
       });
-      D('API RESPONSE:', fullUrl, '→ status:', res.status, res.statusText);
-
       if (res.status === 429) {
         delayMs = Math.min(delayMs * 2, DELAY_MAX);
         const retryAfter = parseInt(res.headers.get('Retry-After')) || Math.ceil(delayMs / 1000);
-        // Escalating cooldowns: 0 → 60s → 2min → 5min
         const cooldown = attempt >= 15 ? 300000 : attempt >= 10 ? 120000 : attempt >= 5 ? 60000 : 0;
         const waitMs = Math.max(retryAfter * 1000, delayMs) + cooldown;
         const waitSec = Math.round(waitMs / 1000);
-        const waitMin = waitSec >= 60 ? `${(waitSec / 60).toFixed(1)}min` : `${waitSec}s`;
-        D('API 429: waiting', waitMs, 'ms, delayMs =', delayMs, ', cooldown =', cooldown, ', attempt =', attempt);
-        progress(`Rate limited — waiting ${waitMin}… (attempt ${attempt})`);
+        const waitLabel = waitSec >= 60 ? `${(waitSec / 60).toFixed(1)}min` : `${waitSec}s`;
+        progress(`Rate limited — waiting ${waitLabel}… (attempt ${attempt})`);
         await sleep(waitMs);
         continue;
       }
-
       if (!res.ok) {
         const body = await res.text();
         D('API ERROR BODY:', body.slice(0, 500));
         throw new Error(`${res.status} ${res.statusText} — ${path}`);
       }
-
-      // Success — gradually recover speed
-      if (delayMs > DELAY_INITIAL) {
-        delayMs = Math.max(DELAY_INITIAL, Math.round(delayMs * 0.75));
-        D('API success: delay recovering to', delayMs, 'ms');
-      }
-
-      const data = await res.json();
-      D('API RESPONSE DATA keys:', Object.keys(data), ', total:', data.total, ', items:', data.items?.length);
-      return data;
+      if (delayMs > DELAY_INITIAL) delayMs = Math.max(DELAY_INITIAL, Math.round(delayMs * 0.75));
+      return await res.json();
     }
   }
 
+  // --- Listing + filtering ---
   async function listConversations(archived, auth, maxItems = 0) {
-    D('listConversations: archived =', archived, ', maxItems =', maxItems);
     let offset = 0;
     let total = null;
     const items = [];
     const pageSize = maxItems > 0 ? Math.min(LIMIT, maxItems) : LIMIT;
-    D('listConversations: pageSize =', pageSize);
     while (total === null || offset < total) {
       checkAbort();
       const url = `/conversations?offset=${offset}&limit=${pageSize}&order=updated&is_archived=${archived}&is_starred=false`;
-      D('listConversations: fetching url =', url);
       const data = await api(url, auth);
       total = data.total;
-      D('listConversations: page result — total:', total, ', items in page:', data.items?.length, ', accumulated:', items.length + (data.items?.length || 0));
-      if (data.items) {
-        for (const item of data.items) {
-          D('  conversation:', item.id, '|', item.title, '| gizmo_id:', item.gizmo_id, '| archived:', item.is_archived);
-        }
-      }
       items.push(...(data.items || []));
       offset += pageSize;
-      if (maxItems > 0 && items.length >= maxItems) {
-        D('listConversations: early stop — have', items.length, '>= maxItems', maxItems);
-        break;
-      }
+      if (maxItems > 0 && items.length >= maxItems) break;
       if (offset < total) await sleep(delayMs);
     }
-    const result = maxItems > 0 ? items.slice(0, maxItems) : items;
-    D('listConversations: returning', result.length, 'items');
-    return result;
+    return maxItems > 0 ? items.slice(0, maxItems) : items;
   }
 
-  function filterConversations(items, options) {
-    D('filterConversations: input count =', items.length);
-    D('filterConversations: options =', JSON.stringify(options));
+  function filterConversations(items, filters) {
     let filtered = items;
-
-    if (options.project && options.project !== 'all') {
-      const before = filtered.length;
-      if (options.project === 'inbox') {
-        filtered = filtered.filter((c) => !c.gizmo_id);
-        D('filterConversations: inbox filter — before:', before, ', after:', filtered.length);
-      } else {
-        D('filterConversations: project filter — looking for gizmo_id ===', JSON.stringify(options.project));
-        filtered.forEach((c) => {
-          D('  checking:', c.id, '| gizmo_id:', JSON.stringify(c.gizmo_id), '| match:', c.gizmo_id === options.project);
-        });
-        filtered = filtered.filter((c) => c.gizmo_id === options.project);
-        D('filterConversations: project filter — before:', before, ', after:', filtered.length);
-      }
+    if (filters.project && filters.project !== 'all') {
+      if (filters.project === 'inbox') filtered = filtered.filter((c) => !c.gizmo_id);
+      else filtered = filtered.filter((c) => c.gizmo_id === filters.project);
     }
-
-    if (options.keyword) {
-      const before = filtered.length;
-      const kw = options.keyword.toLowerCase();
-      filtered = filtered.filter(
-        (c) => c.title && c.title.toLowerCase().includes(kw)
-      );
-      D('filterConversations: keyword filter "' + kw + '" — before:', before, ', after:', filtered.length);
+    if (filters.keyword) {
+      const kw = filters.keyword.toLowerCase();
+      filtered = filtered.filter((c) => c.title && c.title.toLowerCase().includes(kw));
     }
-
-    if (options.dateFrom) {
-      const before = filtered.length;
-      const from = new Date(options.dateFrom).getTime() / 1000;
+    if (filters.dateFrom) {
+      const from = new Date(filters.dateFrom).getTime() / 1000;
       filtered = filtered.filter((c) => {
-        const t =
-          typeof c.create_time === 'string'
-            ? new Date(c.create_time).getTime() / 1000
-            : c.create_time;
+        const t = typeof c.create_time === 'string' ? new Date(c.create_time).getTime() / 1000 : c.create_time;
         return t >= from;
       });
-      D('filterConversations: dateFrom filter — before:', before, ', after:', filtered.length);
     }
-
-    if (options.dateTo) {
-      const before = filtered.length;
-      const to = new Date(options.dateTo + 'T23:59:59').getTime() / 1000;
+    if (filters.dateTo) {
+      const to = new Date(filters.dateTo + 'T23:59:59').getTime() / 1000;
       filtered = filtered.filter((c) => {
-        const t =
-          typeof c.create_time === 'string'
-            ? new Date(c.create_time).getTime() / 1000
-            : c.create_time;
+        const t = typeof c.create_time === 'string' ? new Date(c.create_time).getTime() / 1000 : c.create_time;
         return t <= to;
       });
-      D('filterConversations: dateTo filter — before:', before, ', after:', filtered.length);
     }
-
-    if (options.limit > 0) {
-      const before = filtered.length;
-      filtered = filtered.slice(0, options.limit);
-      D('filterConversations: limit', options.limit, '— before:', before, ', after:', filtered.length);
-    }
-
-    D('filterConversations: final count =', filtered.length);
+    if (filters.limit > 0) filtered = filtered.slice(0, filters.limit);
     return filtered;
   }
 
-  function extractFileRefs(conversation) {
-    const files = [];
-    const mapping = conversation.mapping || {};
-    for (const node of Object.values(mapping)) {
-      const msg = node.message;
-      if (!msg) continue;
-
-      const parts = msg.content?.parts || [];
-      for (const part of parts) {
-        if (typeof part === 'object' && part !== null) {
-          if (part.asset_pointer) {
-            files.push({
-              type: 'image',
-              url: part.asset_pointer,
-              content_type: part.content_type || 'image/png',
-              name: part.metadata?.dalle?.prompt?.slice(0, 50) || 'image',
-            });
-          }
-          if (part.name && part.download_url) {
-            files.push({
-              type: 'file',
-              url: part.download_url,
-              content_type: part.content_type || 'application/octet-stream',
-              name: part.name,
-            });
-          }
-        }
-      }
-
-      const attachments = msg.metadata?.attachments || [];
-      for (const att of attachments) {
-        if (att.download_url || att.id) {
-          files.push({
-            type: 'attachment',
-            url: att.download_url || null,
-            id: att.id,
-            content_type: att.mimeType || 'application/octet-stream',
-            name: att.name || att.id,
-          });
-        }
-      }
-    }
-    D('extractFileRefs:', files.length, 'files found');
-    return files;
+  async function listProjects() {
+    const auth = await getAuth();
+    const data = await api('/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=0&limit=50', auth);
+    return (data.items || []).map((item) => {
+      const g = item.gizmo?.gizmo || {};
+      const display = g.display || {};
+      return { id: g.id, name: display.name || 'Untitled', emoji: display.emoji || '', interactions: g.num_interactions || 0 };
+    });
   }
 
-  async function fetchAttachmentDetailed(url, auth) {
-    D('fetchAttachmentDetailed:', url);
+  async function listProjectConversations(gizmoId, auth) {
     try {
-      let resolvedUrl = url;
-
-      // file-service:// URLs need two-step resolution
-      if (url && url.startsWith('file-service://')) {
-        const fileId = url.replace('file-service://', '');
-        D('fetchAttachmentDetailed: resolving file-service URL, fileId =', fileId);
-        try {
-          const meta = await api(`/files/download/${fileId}?post_id=&inline=false`, auth);
-          if (!meta.download_url) {
-            D('fetchAttachmentDetailed: no download_url in response:', JSON.stringify(meta));
-            return { ok: false, status: 0, reason: 'no-download-url' };
-          }
-          resolvedUrl = meta.download_url;
-          D('fetchAttachmentDetailed: resolved to', resolvedUrl);
-        } catch (e) {
-          // api() throws "STATUS STATUSTEXT — /path" — extract status code
-          const m = /^(\d{3})\s/.exec(e.message || '');
-          const status = m ? parseInt(m[1]) : 0;
-          D('fetchAttachmentDetailed: resolve failed', status, e.message);
-          return { ok: false, status, reason: 'resolve-failed' };
-        }
+      let offset = 0, total = null;
+      const items = [];
+      while (total === null || offset < total) {
+        checkAbort();
+        const url = `/gizmos/${gizmoId}/conversations?offset=${offset}&limit=${LIMIT}`;
+        const data = await api(url, auth);
+        total = data.total;
+        items.push(...(data.items || data.conversations || []));
+        offset += LIMIT;
+        if (offset < total) await sleep(delayMs);
       }
-
-      if (!resolvedUrl) return { ok: false, status: 0, reason: 'no-url' };
-
-      let attempt = 0;
-      while (true) {
-        attempt++;
-        const fetchUrl = resolvedUrl.startsWith('http') ? resolvedUrl : `https://chatgpt.com${resolvedUrl}`;
-        D('fetchAttachmentDetailed: fetching', fetchUrl, attempt > 1 ? `(attempt ${attempt})` : '');
-        const res = await fetch(fetchUrl, {
-          credentials: 'include',
-          headers: { Authorization: `Bearer ${auth.token}` },
-        });
-        D('fetchAttachmentDetailed: status =', res.status);
-
-        if (res.status === 429) {
-          delayMs = Math.min(delayMs * 2, DELAY_MAX);
-          const retryAfter = parseInt(res.headers.get('Retry-After')) || Math.ceil(delayMs / 1000);
-          const cooldown = attempt >= 15 ? 300000 : attempt >= 10 ? 120000 : attempt >= 5 ? 60000 : 0;
-          const waitMs = Math.max(retryAfter * 1000, delayMs) + cooldown;
-          const waitSec = Math.round(waitMs / 1000);
-          const waitMin = waitSec >= 60 ? `${(waitSec / 60).toFixed(1)}min` : `${waitSec}s`;
-          D('fetchAttachmentDetailed 429: waiting', waitMs, 'ms, attempt =', attempt);
-          progress(`Rate limited on attachment — waiting ${waitMin}… (attempt ${attempt})`);
-          await sleep(waitMs);
-          continue;
-        }
-
-        if (!res.ok) {
-          D('fetchAttachmentDetailed: failed with', res.status);
-          return { ok: false, status: res.status, reason: 'http-error' };
-        }
-
-        if (delayMs > DELAY_INITIAL) {
-          delayMs = Math.max(DELAY_INITIAL, Math.round(delayMs * 0.75));
-        }
-
-        const blob = await res.blob();
-        const dataUrl = await new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result);
-          reader.readAsDataURL(blob);
-        });
-        return { ok: true, status: res.status, data: dataUrl };
-      }
+      if (items.length > 0) return items;
     } catch (e) {
-      D('fetchAttachmentDetailed: error =', e.message);
-      return { ok: false, status: 0, reason: e.message };
+      if (e.message === 'Cancelled by user') throw e;
+      D('listProjectConversations: gizmo endpoint failed, falling back', e.message);
     }
+    const sidebar = await api(`/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=200&limit=50`, auth);
+    const match = (sidebar.items || []).find((item) => item.gizmo?.gizmo?.id === gizmoId);
+    return match?.conversations || [];
   }
 
-  // Back-compat wrapper — returns dataURL or null, used by the live export path
-  async function fetchAttachment(url, auth) {
-    const r = await fetchAttachmentDetailed(url, auth);
-    return r.ok ? r.data : null;
-  }
-
-  // --- Build target list from filters (list + filter phase) ---
-  async function buildTargetList(options, auth) {
-    const isProjectFilter = options.project && options.project !== 'all' && options.project !== 'inbox';
+  async function buildTargetList(filters, auth) {
+    const isProjectFilter = filters.project && filters.project !== 'all' && filters.project !== 'inbox';
     let all = [];
-
     if (isProjectFilter) {
-      D('buildTargetList: project filter', options.project);
       progress('Listing project conversations…', 5);
-      const projectConvs = await listProjectConversations(options.project, auth);
-      all.push(...projectConvs.map((c) => ({ ...c, _source: 'active' })));
+      const pc = await listProjectConversations(filters.project, auth);
+      all.push(...pc.map((c) => ({ ...c, _source: 'active' })));
     } else {
-      const hasClientFilters = options.keyword || options.dateFrom || options.dateTo
-        || options.project === 'inbox';
-      const earlyLimit = (!hasClientFilters && options.limit > 0) ? options.limit : 0;
-      D('buildTargetList: hasClientFilters =', hasClientFilters, 'earlyLimit =', earlyLimit);
-
-      if (options.source === 'active' || options.source === 'both') {
+      const hasClientFilters = filters.keyword || filters.dateFrom || filters.dateTo || filters.project === 'inbox';
+      const earlyLimit = (!hasClientFilters && filters.limit > 0) ? filters.limit : 0;
+      if (filters.source === 'active' || filters.source === 'both') {
         checkAbort();
         progress('Listing active conversations…', 5);
         const active = await listConversations(false, auth, earlyLimit);
         all.push(...active.map((c) => ({ ...c, _source: 'active' })));
       }
-      if (options.source === 'archived' || options.source === 'both') {
-        if (earlyLimit > 0 && all.length >= earlyLimit) {
-          D('buildTargetList: skipping archived — earlyLimit satisfied');
-        } else {
+      if (filters.source === 'archived' || filters.source === 'both') {
+        if (!(earlyLimit > 0 && all.length >= earlyLimit)) {
           checkAbort();
           progress('Listing archived conversations…', 10);
           await sleep(delayMs);
@@ -430,244 +237,93 @@ if (!window.__chatgptExportLoaded) {
         }
       }
     }
-
     const seen = new Set();
-    all = all.filter((c) => {
-      if (seen.has(c.id)) return false;
-      seen.add(c.id);
-      return true;
-    });
-
-    return filterConversations(all, options);
+    all = all.filter((c) => (seen.has(c.id) ? false : (seen.add(c.id), true)));
+    return filterConversations(all, filters);
   }
 
-  // --- Build export data object from a checkpoint ---
-  function buildExportData(cp, auth) {
-    const conversations = Object.values(cp.fetched);
-    const errors = cp.failed || [];
-    const attachmentMap = cp.attachments || {};
-    return {
-      exported_at: new Date().toISOString(),
-      account: (auth && auth.accountId) || cp.account || 'unknown',
-      filters: cp.options,
-      stats: {
-        total_listed: cp.targetIds.length,
-        after_filters: cp.targetIds.length,
-        fetched: conversations.length,
-        errors: errors.length,
-        attachments: Object.keys(attachmentMap).length,
-        mode: cp.mode,
-      },
-      errors,
-      conversations,
-      ...(Object.keys(attachmentMap).length > 0 ? { attachments: attachmentMap } : {}),
-    };
-  }
-
-  // --- Download export data as a file (format depends on options.format) ---
-  function downloadExport(exportData, fmt) {
-    const datestamp = new Date().toISOString().slice(0, 10);
-    const formats = {
-      json:     { ext: 'json',  mime: 'application/json',        fn: () => JSON.stringify(exportData, null, 2) },
-      markdown: { ext: 'md',    mime: 'text/markdown',           fn: () => toMarkdown(exportData) },
-      jsonl:    { ext: 'jsonl', mime: 'application/x-jsonlines', fn: () => toJSONL(exportData) },
-      html:     { ext: 'html',  mime: 'text/html',               fn: () => toHTML(exportData) },
-      csv:      { ext: 'csv',   mime: 'text/csv',                fn: () => toCSV(exportData) },
-      txt:      { ext: 'txt',   mime: 'text/plain',              fn: () => toPlainText(exportData) },
-    };
-    const { ext, mime, fn } = formats[fmt] || formats.json;
-    const content = fn();
-    const blob = new Blob([content], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `chatgpt-export-${datestamp}.${ext}`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    return { ext, size: content.length };
-  }
-
-  // --- Run fetch loop over a target list, writing checkpoint after every item ---
-  async function fetchLoop(cp, auth) {
-    const remaining = cp.targetIds.filter((id) => !cp.fetched[id]);
-    D('fetchLoop: total =', cp.targetIds.length, 'already fetched =', Object.keys(cp.fetched).length, 'remaining =', remaining.length);
-
-    if (remaining.length === 0) {
-      progress('All target conversations already fetched', 90);
-      return;
-    }
-
-    for (let i = 0; i < remaining.length; i++) {
-      checkAbort();
-      const id = remaining[i];
-      const alreadyDone = Object.keys(cp.fetched).length;
-      const totalTarget = cp.targetIds.length;
-      const pct = 15 + Math.round(((alreadyDone + 1) / totalTarget) * 75);
-      progress(`[${alreadyDone + 1}/${totalTarget}] ${id.slice(0, 8)}…`, pct);
-
-      let data = null;
-      let attachmentsFetched = null;
-      try {
-        D('fetchLoop: fetching', id);
-        data = await api(`/conversation/${id}`, auth);
-
-        if (cp.options.attachments) {
-          const files = extractFileRefs(data);
-          if (files.length > 0) {
-            D('fetchLoop: fetching', files.length, 'attachments for', id);
-            const fetched = [];
-            for (const f of files) {
-              checkAbort();
-              if (f.url) {
-                const dataUrl = await fetchAttachment(f.url, auth);
-                fetched.push({ ...f, data: dataUrl });
-              } else {
-                fetched.push(f);
-              }
-              await sleep(delayMs);
-            }
-            attachmentsFetched = fetched;
+  // --- Attachment extraction + fetching ---
+  function extractFileRefs(conversation) {
+    const files = [];
+    const mapping = conversation.mapping || {};
+    for (const node of Object.values(mapping)) {
+      const msg = node.message;
+      if (!msg) continue;
+      const parts = msg.content?.parts || [];
+      for (const part of parts) {
+        if (typeof part === 'object' && part !== null) {
+          if (part.asset_pointer) {
+            files.push({ type: 'image', url: part.asset_pointer, content_type: part.content_type || 'image/png', name: part.metadata?.dalle?.prompt?.slice(0, 50) || 'image' });
+          }
+          if (part.name && part.download_url) {
+            files.push({ type: 'file', url: part.download_url, content_type: part.content_type || 'application/octet-stream', name: part.name });
           }
         }
-
-        // Only mark as fetched after conv + attachments both succeeded
-        cp.fetched[id] = data;
-        if (attachmentsFetched) {
-          cp.attachments = cp.attachments || {};
-          cp.attachments[id] = attachmentsFetched;
-        }
-        // Clear any prior failure entry for this id on success
-        if (cp.failed && cp.failed.length) {
-          cp.failed = cp.failed.filter((f) => f.id !== id);
-        }
-      } catch (e) {
-        if (e.message === 'Cancelled by user' || e.message === 'Paused by user') throw e;
-        D('fetchLoop: ERROR fetching', id, ':', e.message);
-        cp.failed = cp.failed || [];
-        cp.failed = cp.failed.filter((f) => f.id !== id);
-        cp.failed.push({ id, title: id.slice(0, 8), error: e.message });
       }
-
-      // Checkpoint after every fetch — this is the whole point
-      await saveCheckpoint(cp);
-
-      if (i < remaining.length - 1) await sleep(delayMs);
+      const attachments = msg.metadata?.attachments || [];
+      for (const att of attachments) {
+        if (att.download_url || att.id) {
+          files.push({ type: 'attachment', url: att.download_url || null, id: att.id, content_type: att.mimeType || 'application/octet-stream', name: att.name || att.id });
+        }
+      }
     }
+    return files;
   }
 
-  // --- Main export entry point ---
-  async function runExport(options) {
-    D('========== runExport START ==========');
-    D('runExport: options =', JSON.stringify(options, null, 2));
+  async function fetchAttachmentDetailed(url, auth) {
     try {
-      progress('Authenticating…', 0);
-      const auth = await getAuth();
-      D('runExport: auth OK, accountId =', auth.accountId);
-
-      // Resume mode: options include _resume flag and we have a matching checkpoint
-      let cp = await loadCheckpoint();
-
-      if (options._resume && cp && optionsMatch(cp.options, options)) {
-        D('runExport: RESUMING from existing checkpoint');
-        cp.paused = false;
-        progress(`Resuming — ${Object.keys(cp.fetched).length}/${cp.targetIds.length} already fetched`, 15);
-        await saveCheckpoint(cp);
-      } else if (options._retryIds && Array.isArray(options._retryIds) && options._retryIds.length > 0) {
-        D('runExport: RETRY-BY-ID mode with', options._retryIds.length, 'ids');
-        cp = {
-          runId: Date.now().toString(),
-          mode: 'retry',
-          options,
-          startedAt: new Date().toISOString(),
-          account: auth.accountId,
-          targetIds: options._retryIds.slice(),
-          fetched: {},
-          failed: [],
-          attachments: {},
-          paused: false,
-        };
-        progress(`Retry-by-ID: ${cp.targetIds.length} conversations queued`, 15);
-        await saveCheckpoint(cp);
-      } else {
-        // Fresh list-based run — build target list, then create new checkpoint
-        D('runExport: FRESH run — building target list');
-        const filtered = await buildTargetList(options, auth);
-        progress(`Found ${filtered.length} conversations`, 15);
-        if (filtered.length === 0) {
-          await clearCheckpoint();
-          done('No conversations match your filters.');
-          return;
+      let resolvedUrl = url;
+      if (url && url.startsWith('file-service://')) {
+        const fileId = url.replace('file-service://', '');
+        try {
+          const meta = await api(`/files/download/${fileId}?post_id=&inline=false`, auth);
+          if (!meta.download_url) return { ok: false, status: 0, reason: 'no-download-url' };
+          resolvedUrl = meta.download_url;
+        } catch (e) {
+          const m = /^(\d{3})\s/.exec(e.message || '');
+          return { ok: false, status: m ? parseInt(m[1]) : 0, reason: 'resolve-failed' };
         }
-        cp = {
-          runId: Date.now().toString(),
-          mode: 'list',
-          options,
-          startedAt: new Date().toISOString(),
-          account: auth.accountId,
-          targetIds: filtered.map((c) => c.id),
-          // Preserve source labels from the listing phase for later use
-          targetMeta: Object.fromEntries(filtered.map((c) => [c.id, { title: c.title, _source: c._source }])),
-          fetched: {},
-          failed: [],
-          attachments: {},
-          paused: false,
-        };
-        await saveCheckpoint(cp);
       }
+      if (!resolvedUrl) return { ok: false, status: 0, reason: 'no-url' };
 
-      await fetchLoop(cp, auth);
-
-      checkAbort();
-      progress('Building export…', 92);
-      const exportData = buildExportData(cp, auth);
-
-      const fmt = options.format || 'json';
-      progress(`Generating ${fmt.toUpperCase()}…`, 95);
-      const { ext } = downloadExport(exportData, fmt);
-      D('runExport: download triggered —', ext);
-
-      // Completed — clear checkpoint
-      await clearCheckpoint();
-
-      const errCount = (cp.failed || []).length;
-      done(
-        `Exported ${Object.keys(cp.fetched).length} conversations as ${ext.toUpperCase()}` +
-          (errCount ? `, ${errCount} errors` : '')
-      );
-      D('========== runExport END ==========');
+      let attempt = 0;
+      while (true) {
+        attempt++;
+        const fetchUrl = resolvedUrl.startsWith('http') ? resolvedUrl : `https://chatgpt.com${resolvedUrl}`;
+        const res = await fetch(fetchUrl, { credentials: 'include', headers: { Authorization: `Bearer ${auth.token}` } });
+        if (res.status === 429) {
+          delayMs = Math.min(delayMs * 2, DELAY_MAX);
+          const retryAfter = parseInt(res.headers.get('Retry-After')) || Math.ceil(delayMs / 1000);
+          const cooldown = attempt >= 15 ? 300000 : attempt >= 10 ? 120000 : attempt >= 5 ? 60000 : 0;
+          const waitMs = Math.max(retryAfter * 1000, delayMs) + cooldown;
+          const waitSec = Math.round(waitMs / 1000);
+          const waitLabel = waitSec >= 60 ? `${(waitSec / 60).toFixed(1)}min` : `${waitSec}s`;
+          progress(`Rate limited on attachment — waiting ${waitLabel}… (attempt ${attempt})`);
+          await sleep(waitMs);
+          continue;
+        }
+        if (!res.ok) return { ok: false, status: res.status, reason: 'http-error' };
+        if (delayMs > DELAY_INITIAL) delayMs = Math.max(DELAY_INITIAL, Math.round(delayMs * 0.75));
+        const blob = await res.blob();
+        const dataUrl = await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.readAsDataURL(blob);
+        });
+        return { ok: true, status: res.status, data: dataUrl };
+      }
     } catch (e) {
-      if (e.message === 'Paused by user') {
-        D('runExport: PAUSED — checkpoint preserved');
-        if (currentCheckpoint) {
-          currentCheckpoint.paused = true;
-          await saveCheckpoint(currentCheckpoint);
-        }
-        const fetchedCount = currentCheckpoint ? Object.keys(currentCheckpoint.fetched).length : 0;
-        const totalCount = currentCheckpoint ? currentCheckpoint.targetIds.length : 0;
-        const text = `Paused — ${fetchedCount}/${totalCount} fetched. Open popup to resume or download partial.`;
-        running = false;
-        setStatus('done', text, Math.round((fetchedCount / (totalCount || 1)) * 100));
-        try { chrome.runtime.sendMessage({ type: 'done', text }); } catch {}
-        return;
-      }
-      D('runExport: FATAL ERROR:', e.message, e.stack);
-      error(e.message);
+      return { ok: false, status: 0, reason: e.message };
     }
   }
 
-  // --- Attachments-only: read an existing export from chrome.storage.local,
-  //     fetch only the attachments, then emit a metadata ZIP + split attachment volumes. ---
-  //
-  // DRY: reuses extractFileRefs, fetchAttachmentDetailed, saveCheckpoint/
-  //      loadCheckpoint/clearCheckpoint, and the standard checkpoint shape
-  //      (targetIds, fetchedFiles) so the existing banner/resume/pause/cancel
-  //      mechanics all work without change.
-  const VOLUME_TARGET_BYTES = 100 * 1024 * 1024; // ~100 MB uncompressed per volume
-  const ATTACH_SOURCE_KEY_DEFAULT = 'attach_source_v1';
-  const ATTACH_META_KEY_DEFAULT = 'attach_source_meta_v1';
+  // Back-compat wrapper
+  async function fetchAttachment(url, auth) {
+    const r = await fetchAttachmentDetailed(url, auth);
+    return r.ok ? r.data : null;
+  }
 
+  // --- File helpers ---
   function pad2(n) { return String(n).padStart(2, '0'); }
   function safeExtFromContentType(ct) {
     if (!ct) return '';
@@ -685,115 +341,239 @@ if (!window.__chatgptExportLoaded) {
     if (!name) return '';
     return String(name).replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(0, 120);
   }
+  function sanitizeTag(tag) {
+    if (!tag) return '';
+    return String(tag).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+  }
   function base64FromDataUrl(dataUrl) {
     if (!dataUrl || typeof dataUrl !== 'string') return null;
     const i = dataUrl.indexOf(',');
-    if (i < 0) return null;
-    return dataUrl.slice(i + 1);
+    return i < 0 ? null : dataUrl.slice(i + 1);
   }
   function approxBytesFromB64(b64) {
     if (!b64) return 0;
-    // base64 → bytes: length * 3/4, minus padding
     const pad = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
     return Math.floor((b64.length * 3) / 4) - pad;
   }
 
-  async function readSourceJsonFromStorage(options) {
-    const srcKey = options._sourceKey || ATTACH_SOURCE_KEY_DEFAULT;
-    const metaKey = options._sourceMetaKey || ATTACH_META_KEY_DEFAULT;
+  // --- Source-file staging (file-source path) ---
+  async function readSourceJsonFromStorage(config) {
+    const srcKey = config.source.sourceKey || ATTACH_SOURCE_KEY_DEFAULT;
+    const metaKey = config.source.sourceMetaKey || ATTACH_META_KEY_DEFAULT;
     const result = await chrome.storage.local.get([srcKey, metaKey]);
     const text = result[srcKey];
     if (!text || typeof text !== 'string') {
       throw new Error(`Source JSON not found in chrome.storage.local (key=${srcKey}). Re-select the file.`);
     }
     let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch (e) {
-      throw new Error(`Source JSON parse failed: ${e.message}`);
-    }
+    try { parsed = JSON.parse(text); }
+    catch (e) { throw new Error(`Source JSON parse failed: ${e.message}`); }
     if (!parsed || !Array.isArray(parsed.conversations)) {
       throw new Error('Source JSON missing conversations[] array');
     }
     return { text, parsed, meta: result[metaKey] || {} };
   }
 
-  async function clearStagedSource(options) {
-    const srcKey = options._sourceKey || ATTACH_SOURCE_KEY_DEFAULT;
-    const metaKey = options._sourceMetaKey || ATTACH_META_KEY_DEFAULT;
-    try {
-      await chrome.storage.local.remove([srcKey, metaKey]);
-    } catch (e) {
-      D('clearStagedSource: error', e.message);
-    }
+  async function clearStagedSource(config) {
+    const srcKey = config.source.sourceKey || ATTACH_SOURCE_KEY_DEFAULT;
+    const metaKey = config.source.sourceMetaKey || ATTACH_META_KEY_DEFAULT;
+    try { await chrome.storage.local.remove([srcKey, metaKey]); }
+    catch (e) { D('clearStagedSource:', e.message); }
   }
 
-  function triggerBlobDownload(blob, filename) {
+  // --- Download primitives (all take a path with optional "folder/" prefix) ---
+  function triggerBlobDownload(blob, path) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = filename;
+    a.download = path;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 30_000);
   }
+  function triggerTextDownload(text, mime, path) {
+    triggerBlobDownload(new Blob([text], { type: mime }), path);
+  }
+  function triggerJsonDownload(obj, path) {
+    triggerTextDownload(JSON.stringify(obj, null, 2), 'application/json', path);
+  }
 
-  async function runAttachmentsOnly(options) {
-    D('========== runAttachmentsOnly START ==========');
-    D('runAttachmentsOnly: sourceKey =', options._sourceKey, 'sourceExportedAt =', options._sourceExportedAt);
-    try {
-      // 1. Load source from storage (string text + parsed object)
-      progress('Loading source JSON from storage…', 0);
-      const { text: sourceText, parsed: sourceExport } = await readSourceJsonFromStorage(options);
+  // --- v4 run folder + tag + hash ---
+  function randomHash(n) {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let s = '';
+    for (let i = 0; i < n; i++) s += chars[Math.floor(Math.random() * chars.length)];
+    return s;
+  }
+  function timestampForFolder() {
+    const d = new Date();
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}${pad2(d.getMinutes())}`;
+  }
+  function deriveTag(config, sourceMeta) {
+    if (config.tag) return sanitizeTag(config.tag);
+    const kind = config.source.kind;
+    if (kind === 'fresh') return 'fresh';
+    if (kind === 'byids') return `byids-${(config.source.ids || []).length}`;
+    if (kind === 'file') {
+      const name = (sourceMeta && sourceMeta.fileName) || config.source.ref || 'file';
+      const base = String(name).replace(/\.json$/i, '');
+      return `file-${sanitizeTag(base)}`;
+    }
+    return 'run';
+  }
+  function runFolderName(config, sourceMeta, partial) {
+    const ts = timestampForFolder();
+    const hash = randomHash(4);
+    const tag = deriveTag(config, sourceMeta) + (partial ? '-partial' : '');
+    return `chatgpt-run-${ts}-${hash}-${tag}`;
+  }
 
-      progress('Authenticating…', 2);
-      const auth = await getAuth();
+  // --- Config identity (for resume matching) ---
+  function configMatch(a, b) {
+    if (!a || !b) return false;
+    if (a.source?.kind !== b.source?.kind) return false;
+    if (a.source.kind === 'byids') {
+      const aIds = (a.source.ids || []).slice().sort();
+      const bIds = (b.source.ids || []).slice().sort();
+      if (aIds.length !== bIds.length) return false;
+      for (let i = 0; i < aIds.length; i++) if (aIds[i] !== bIds[i]) return false;
+    }
+    if (a.source.kind === 'file') {
+      if ((a.source.exportedAt ?? null) !== (b.source.exportedAt ?? null)) return false;
+      if ((a.source.sourceKey ?? null) !== (b.source.sourceKey ?? null)) return false;
+    }
+    if (a.source.kind === 'fresh') {
+      const f = a.source.filters || {}, g = b.source.filters || {};
+      const keys = ['project', 'source', 'dateFrom', 'dateTo', 'keyword', 'limit'];
+      for (const k of keys) if ((f[k] ?? null) !== (g[k] ?? null)) return false;
+    }
+    if (!!a.fetch?.conversations !== !!b.fetch?.conversations) return false;
+    if (!!a.fetch?.attachments !== !!b.fetch?.attachments) return false;
+    if ((a.output?.kind ?? null) !== (b.output?.kind ?? null)) return false;
+    if ((a.output?.format ?? null) !== (b.output?.format ?? null)) return false;
+    return true;
+  }
 
-      // 2. Build plan
+  // --- Plan: convIds + fileTargets + source metadata ---
+  async function buildPlan(config, auth, sourceBundle) {
+    const kind = config.source.kind;
+    if (kind === 'fresh') {
+      progress('Building target list from filters…', 5);
+      const filtered = await buildTargetList(config.source.filters || {}, auth);
+      return {
+        convIds: filtered.map((c) => c.id),
+        convMeta: Object.fromEntries(filtered.map((c) => [c.id, { title: c.title, _source: c._source }])),
+        fileTargets: [],
+        sourceConvs: null,
+        sourceMeta: null,
+      };
+    }
+    if (kind === 'byids') {
+      const ids = (config.source.ids || []).slice();
+      return {
+        convIds: ids,
+        convMeta: Object.fromEntries(ids.map((id) => [id, { title: id.slice(0, 8) }])),
+        fileTargets: [],
+        sourceConvs: null,
+        sourceMeta: null,
+      };
+    }
+    if (kind === 'file') {
       progress('Scanning source JSON for attachments…', 5);
-      const plan = []; // [{convId, fileIndex, file, convTitle}]
-      const filesByConv = {};
-      for (const conv of sourceExport.conversations) {
+      const convs = sourceBundle.parsed.conversations || [];
+      const sourceConvs = {};
+      const fileTargets = [];
+      for (const conv of convs) {
         const convId = conv && (conv.conversation_id || conv.id);
         if (!convId) continue;
+        sourceConvs[convId] = conv;
         const files = extractFileRefs(conv);
-        if (files.length === 0) continue;
-        filesByConv[convId] = files;
         for (let i = 0; i < files.length; i++) {
-          plan.push({ convId, fileIndex: i, file: files[i], convTitle: conv.title || '' });
+          fileTargets.push({ convId, fileIndex: i, file: files[i], convTitle: conv.title || '' });
         }
       }
-      const totalFiles = plan.length;
-      D('runAttachmentsOnly: convs with files =', Object.keys(filesByConv).length, 'total files =', totalFiles);
-      progress(`Found ${totalFiles} attachments across ${Object.keys(filesByConv).length} conversations`, 10);
+      return {
+        convIds: [],
+        convMeta: {},
+        fileTargets,
+        sourceConvs,
+        sourceMeta: {
+          exportedAt: sourceBundle.parsed.exported_at || null,
+          unified: sourceBundle.parsed.unified === true,
+          ref: sourceBundle.meta.fileName || null,
+          bytes: sourceBundle.meta.bytes || null,
+        },
+      };
+    }
+    throw new Error(`Unknown source kind: ${kind}`);
+  }
 
-      if (totalFiles === 0) {
-        await clearStagedSource(options);
-        done('No attachments found in source JSON.');
-        return;
+  // --- Strict Source×Fetch validation (matches popup matrix) ---
+  function validateConfig(config) {
+    const kind = config.source?.kind;
+    const wantConv = !!config.fetch?.conversations;
+    const wantAtt = !!config.fetch?.attachments;
+    if (!['fresh', 'byids', 'file'].includes(kind)) throw new Error(`Invalid source.kind: ${kind}`);
+    if (!wantConv && !wantAtt) throw new Error('Select at least one of Conversations / Attachments');
+    if (kind === 'file' && wantConv) throw new Error('File source does not re-fetch conversations — select Attachments only');
+    if ((kind === 'fresh' || kind === 'byids') && !wantConv && wantAtt) {
+      throw new Error('Fresh/ByIds require Fetch=Conversations; attachments are derived from fetched conversations');
+    }
+    if (kind === 'byids' && (!Array.isArray(config.source.ids) || config.source.ids.length === 0)) {
+      throw new Error('ByIds source requires a non-empty ids list');
+    }
+    if (!config.output?.kind || !['json', 'zip'].includes(config.output.kind)) throw new Error('Invalid output.kind');
+  }
+
+  // --- Unified engine ---
+  async function runUnified(config) {
+    D('========== runUnified START ==========');
+    D('config =', JSON.stringify(config, (k, v) => (typeof v === 'string' && v.length > 200 ? v.slice(0, 80) + '…' : v)));
+    try {
+      validateConfig(config);
+      progress('Authenticating…', 0);
+      const auth = await getAuth();
+
+      // File source: load staged JSON once
+      let sourceBundle = null;
+      if (config.source.kind === 'file') {
+        progress('Loading source JSON from storage…', 2);
+        sourceBundle = await readSourceJsonFromStorage(config);
       }
 
-      // 3. Load-or-create checkpoint
+      // Resume or fresh checkpoint
       let cp = await loadCheckpoint();
-      const resumeable = cp && cp.mode === 'attachments-only' && optionsMatch(cp.options, options);
-      if (options._resume && resumeable) {
-        D('runAttachmentsOnly: RESUMING from checkpoint');
+      const resumeable = cp && cp.mode === 'unified' && configMatch(cp.config, config);
+      if (config._resume && resumeable) {
         cp.paused = false;
-        progress(`Resuming — ${Object.keys(cp.fetchedFiles).length}/${totalFiles} files already fetched`, 12);
+        const haveConvs = Object.keys(cp.fetchedConvs || {}).length;
+        const haveFiles = Object.keys(cp.fetchedFiles || {}).length;
+        progress(`Resuming — ${haveConvs} convs, ${haveFiles} files already fetched`, 12);
         await saveCheckpoint(cp);
       } else {
+        const plan = await buildPlan(config, auth, sourceBundle);
+        if (plan.convIds.length === 0 && plan.fileTargets.length === 0) {
+          await clearCheckpoint();
+          if (config.source.kind === 'file') await clearStagedSource(config);
+          done('Nothing to fetch — empty plan.');
+          return;
+        }
         cp = {
           runId: Date.now().toString(),
-          mode: 'attachments-only',
-          options,
+          mode: 'unified',
+          config,
           startedAt: new Date().toISOString(),
           account: auth.accountId,
-          targetIds: plan.map((p) => `${p.convId}:${p.fileIndex}`),
-          fetched: {},          // unused in this mode; kept for banner compat
-          fetchedFiles: {},     // key "convId:idx" → { ...file, data: dataURL }
+          convIds: plan.convIds,
+          convMeta: plan.convMeta,
+          fileTargets: plan.fileTargets,
+          sourceConvs: plan.sourceConvs,
+          sourceMeta: plan.sourceMeta,
+          fetchedConvs: {},
+          fetchedFiles: {},
+          skipped: [],
           failed: [],
-          skipped: [],          // 404s after the early-abort guard passes
           earlyAttempts: 0,
           earlyFails: 0,
           paused: false,
@@ -801,274 +581,366 @@ if (!window.__chatgptExportLoaded) {
         await saveCheckpoint(cp);
       }
 
-      // 4. Fetch loop — identical guard semantics to the previous revision
-      for (let i = 0; i < plan.length; i++) {
-        checkAbort();
-        const p = plan[i];
-        const key = `${p.convId}:${p.fileIndex}`;
-        if (cp.fetchedFiles[key] || (cp.skipped || []).some((s) => s.key === key)) continue;
-
-        const doneCount = Object.keys(cp.fetchedFiles).length + (cp.skipped || []).length;
-        const pct = 15 + Math.round(((doneCount + 1) / totalFiles) * 75);
-        progress(`[${doneCount + 1}/${totalFiles}] ${p.convId.slice(0, 8)}… ${p.file.name || ''}`.trim(), pct);
-
-        let result = null;
-        if (!p.file.url) {
-          cp.fetchedFiles[key] = { ...p.file, data: null, _note: 'no-url-in-source' };
-        } else {
+      // Phase 1: fetch conversations (fresh + byids paths)
+      if (config.fetch.conversations && cp.convIds.length > 0) {
+        const remaining = cp.convIds.filter((id) => !cp.fetchedConvs[id]);
+        for (let i = 0; i < remaining.length; i++) {
+          checkAbort();
+          const id = remaining[i];
+          const doneCount = Object.keys(cp.fetchedConvs).length;
+          const pct = 15 + Math.round(((doneCount + 1) / cp.convIds.length) * 60);
+          progress(`[${doneCount + 1}/${cp.convIds.length}] ${id.slice(0, 8)}…`, pct);
           try {
-            result = await fetchAttachmentDetailed(p.file.url, auth);
+            const data = await api(`/conversation/${id}`, auth);
+            cp.fetchedConvs[id] = data;
+
+            // Inline attachment fetch per conv if requested
+            if (config.fetch.attachments) {
+              const files = extractFileRefs(data);
+              for (let j = 0; j < files.length; j++) {
+                checkAbort();
+                const f = files[j];
+                const key = `${id}:${j}`;
+                if (cp.fetchedFiles[key] || (cp.skipped || []).some((s) => s.key === key)) continue;
+                await fetchOneFile(cp, key, { convId: id, fileIndex: j, file: f, convTitle: data.title || '' }, auth);
+              }
+            }
+            if (cp.failed && cp.failed.length) cp.failed = cp.failed.filter((f) => f.id !== id);
           } catch (e) {
             if (e.message === 'Cancelled by user' || e.message === 'Paused by user') throw e;
-            result = { ok: false, status: 0, reason: e.message };
+            cp.failed = cp.failed || [];
+            cp.failed = cp.failed.filter((f) => f.id !== id);
+            cp.failed.push({ id, title: id.slice(0, 8), error: e.message });
           }
-
-          if (result.ok) {
-            cp.fetchedFiles[key] = { ...p.file, data: result.data };
-            cp.earlyAttempts = 0;
-            cp.earlyFails = 0;
-          } else if (result.status === 404) {
-            cp.earlyAttempts++;
-            cp.earlyFails++;
-            if (cp.earlyAttempts > 5 && cp.earlyFails === cp.earlyAttempts) {
-              await saveCheckpoint(cp);
-              throw new Error(
-                `Aborted: first ${cp.earlyAttempts} attempts all returned 404. ` +
-                `Session expired or URL format changed — re-login to chatgpt.com and retry.`
-              );
-            }
-            cp.skipped = cp.skipped || [];
-            cp.skipped.push({ key, convId: p.convId, name: p.file.name || null, url: p.file.url, status: 404 });
-          } else {
-            cp.earlyAttempts++;
-            cp.failed.push({ key, convId: p.convId, name: p.file.name || null, url: p.file.url, status: result.status, reason: result.reason });
-          }
+          await saveCheckpoint(cp);
+          if (i < remaining.length - 1) await sleep(delayMs);
         }
-
-        await saveCheckpoint(cp);
-        if (i < plan.length - 1) await sleep(delayMs);
       }
 
-      // 5. Build ZIP volumes
+      // Phase 2: fetch attachments for file-source runs
+      if (config.source.kind === 'file' && config.fetch.attachments) {
+        const total = cp.fileTargets.length;
+        for (let i = 0; i < cp.fileTargets.length; i++) {
+          checkAbort();
+          const t = cp.fileTargets[i];
+          const key = `${t.convId}:${t.fileIndex}`;
+          if (cp.fetchedFiles[key] || (cp.skipped || []).some((s) => s.key === key)) continue;
+          const doneCount = Object.keys(cp.fetchedFiles).length + (cp.skipped || []).length;
+          const pct = 15 + Math.round(((doneCount + 1) / total) * 75);
+          progress(`[${doneCount + 1}/${total}] ${t.convId.slice(0, 8)}… ${t.file?.name || ''}`.trim(), pct);
+          await fetchOneFile(cp, key, t, auth);
+          await saveCheckpoint(cp);
+          if (i < cp.fileTargets.length - 1) await sleep(delayMs);
+        }
+      }
+
+      // Write run folder
       checkAbort();
-      if (typeof JSZip === 'undefined') {
-        throw new Error('JSZip not loaded — the extension must include vendor/jszip.min.js in content_scripts');
-      }
+      progress('Writing run folder…', 92);
+      await writeOutput(cp, config, { partial: false });
 
-      const sourceDate = (sourceExport.exported_at || '').slice(0, 10) || new Date().toISOString().slice(0, 10);
-      const baseName = `chatgpt-export-${sourceDate}-attachments`;
-
-      // Index entries accumulate here; written into the metadata ZIP at the end.
-      const index = {
-        source_exported_at: sourceExport.exported_at || null,
-        generated_at: new Date().toISOString(),
-        stats: {
-          plan: totalFiles,
-          fetched: Object.keys(cp.fetchedFiles).length,
-          skipped_404: (cp.skipped || []).length,
-          failed: (cp.failed || []).length,
-        },
-        volume_target_bytes: VOLUME_TARGET_BYTES,
-        attachments: {}, // asset_pointer (or composite key) → { path, volume, convId, convTitle, name, content_type, bytes }
-        skipped_404: cp.skipped || [],
-        failed: cp.failed || [],
-      };
-
-      progress('Assembling attachment volumes…', 92);
-      let currentZip = new JSZip();
-      let currentBytes = 0;
-      let currentCount = 0;
-      let volNum = 1;
-      const volumeFileNames = [];
-
-      async function flushVolume() {
-        if (currentCount === 0) return;
-        const volName = `${baseName}-vol${pad2(volNum)}.zip`;
-        progress(`Packing ${volName} (${currentCount} files, ~${(currentBytes/1024/1024).toFixed(1)} MB)…`, 92 + Math.min(volNum, 5));
-        const blob = await currentZip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 1 } });
-        triggerBlobDownload(blob, volName);
-        volumeFileNames.push(volName);
-        volNum++;
-        currentZip = new JSZip();
-        currentBytes = 0;
-        currentCount = 0;
-      }
-
-      for (const p of plan) {
-        checkAbort();
-        const key = `${p.convId}:${p.fileIndex}`;
-        const got = cp.fetchedFiles[key];
-        if (!got || !got.data) continue;
-
-        const b64 = base64FromDataUrl(got.data);
-        if (!b64) continue;
-        const bytes = approxBytesFromB64(b64);
-
-        const ext = safeExtFromContentType(got.content_type) || '';
-        const safeName = sanitizeName(got.name) || `attachment-${p.fileIndex}`;
-        const baseFileName = safeName.includes('.') ? safeName : `${safeName}${ext}`;
-        // Folder = full convId per user decision
-        const pathInZip = `attachments/${p.convId}/part${p.fileIndex}-${baseFileName}`;
-
-        currentZip.file(pathInZip, b64, { base64: true });
-        currentBytes += bytes;
-        currentCount++;
-
-        // Record in index (key = original url when unique, else composite)
-        const indexKey = got.url || `${p.convId}:${p.fileIndex}`;
-        index.attachments[indexKey] = {
-          path: pathInZip,
-          volume: `vol${pad2(volNum)}`,
-          convId: p.convId,
-          convTitle: p.convTitle,
-          name: got.name || null,
-          content_type: got.content_type || null,
-          bytes,
-        };
-
-        if (currentBytes >= VOLUME_TARGET_BYTES) {
-          await flushVolume();
-        }
-      }
-      await flushVolume();
-
-      // 6. Metadata ZIP (conversations.json verbatim + attachments-index.json)
-      progress('Packing metadata zip…', 98);
-      const metaZip = new JSZip();
-      metaZip.file('conversations.json', sourceText);
-      index.stats.volumes = volumeFileNames;
-      metaZip.file('attachments-index.json', JSON.stringify(index, null, 2));
-      const metaBlob = await metaZip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
-      triggerBlobDownload(metaBlob, `${baseName}-metadata.zip`);
-
-      // 7. Clean up
       await clearCheckpoint();
-      await clearStagedSource(options);
+      if (config.source.kind === 'file') await clearStagedSource(config);
 
-      const fetched = Object.keys(cp.fetchedFiles).length;
+      const convs = Object.keys(cp.fetchedConvs).length + (config.source.kind === 'file' ? Object.keys(cp.sourceConvs || {}).length : 0);
+      const files = Object.keys(cp.fetchedFiles).length;
       const skipped = (cp.skipped || []).length;
       const failed = (cp.failed || []).length;
-      done(
-        `Attachments: ${fetched}/${totalFiles} fetched across ${volumeFileNames.length} volume(s)` +
-          (skipped ? `, ${skipped} skipped (404)` : '') +
-          (failed ? `, ${failed} failed` : '') +
-          ' · metadata zip with conversations.json + attachments-index.json downloaded last'
-      );
-      D('========== runAttachmentsOnly END ==========');
+      done(`Done — ${convs} convs, ${files} files${skipped ? `, ${skipped} skipped (404)` : ''}${failed ? `, ${failed} failed` : ''}`);
+      D('========== runUnified END ==========');
     } catch (e) {
       if (e.message === 'Paused by user') {
-        D('runAttachmentsOnly: PAUSED');
-        if (currentCheckpoint) {
-          currentCheckpoint.paused = true;
-          await saveCheckpoint(currentCheckpoint);
-        }
-        const fetchedCount = currentCheckpoint ? Object.keys(currentCheckpoint.fetchedFiles || {}).length : 0;
-        const totalCount = currentCheckpoint ? currentCheckpoint.targetIds.length : 0;
-        const text = `Paused — ${fetchedCount}/${totalCount} files fetched. Staged source kept in storage for resume.`;
+        if (currentCheckpoint) { currentCheckpoint.paused = true; await saveCheckpoint(currentCheckpoint); }
+        const cv = currentCheckpoint ? Object.keys(currentCheckpoint.fetchedConvs || {}).length : 0;
+        const fi = currentCheckpoint ? Object.keys(currentCheckpoint.fetchedFiles || {}).length : 0;
+        const text = `Paused — ${cv} convs, ${fi} files fetched. Open popup to resume or download partial.`;
         running = false;
-        setStatus('done', text, Math.round((fetchedCount / (totalCount || 1)) * 100));
+        setStatus('done', text, 50);
         try { chrome.runtime.sendMessage({ type: 'done', text }); } catch {}
         return;
       }
-      D('runAttachmentsOnly: FATAL ERROR:', e.message, e.stack);
+      D('runUnified: FATAL ERROR:', e.message, e.stack);
       error(e.message);
     }
   }
 
-  // --- Download partial export from current checkpoint without waiting for completion ---
+  // --- One-file fetch with early-abort guard ---
+  async function fetchOneFile(cp, key, target, auth) {
+    if (!target.file?.url) {
+      cp.fetchedFiles[key] = { ...target.file, data: null, _note: 'no-url-in-source' };
+      return;
+    }
+    let result;
+    try { result = await fetchAttachmentDetailed(target.file.url, auth); }
+    catch (e) {
+      if (e.message === 'Cancelled by user' || e.message === 'Paused by user') throw e;
+      result = { ok: false, status: 0, reason: e.message };
+    }
+    if (result.ok) {
+      cp.fetchedFiles[key] = { ...target.file, data: result.data };
+      cp.earlyAttempts = 0;
+      cp.earlyFails = 0;
+      return;
+    }
+    if (result.status === 404) {
+      cp.earlyAttempts++;
+      cp.earlyFails++;
+      if (cp.earlyAttempts > 5 && cp.earlyFails === cp.earlyAttempts) {
+        await saveCheckpoint(cp);
+        throw new Error(`Aborted: first ${cp.earlyAttempts} attempts all returned 404. Session expired or URL format changed — re-login to chatgpt.com and retry.`);
+      }
+      cp.skipped = cp.skipped || [];
+      cp.skipped.push({ key, convId: target.convId, name: target.file?.name || null, url: target.file?.url, status: 404 });
+    } else {
+      cp.earlyAttempts++;
+      cp.failed = cp.failed || [];
+      cp.failed.push({ key, convId: target.convId, name: target.file?.name || null, url: target.file?.url, status: result.status, reason: result.reason });
+    }
+  }
+
+  // --- Build the conversations payload in legacy v3.x schema ---
+  function buildConversationsDoc(cp, config, auth) {
+    // Conversations come from fetchedConvs (fresh/byids) or sourceConvs (file)
+    const src = config.source.kind === 'file' ? (cp.sourceConvs || {}) : cp.fetchedConvs;
+    const conversations = Object.values(src);
+    // Attachments map per v3.x schema: { [convId]: [{...file, data}, ...] }
+    const attachmentsMap = {};
+    for (const [key, f] of Object.entries(cp.fetchedFiles || {})) {
+      const [convId] = key.split(':');
+      attachmentsMap[convId] = attachmentsMap[convId] || [];
+      attachmentsMap[convId].push(f);
+    }
+    return {
+      exported_at: new Date().toISOString(),
+      account: auth?.accountId || cp.account || 'unknown',
+      source: { kind: config.source.kind },
+      filters: config.source.kind === 'fresh' ? (config.source.filters || {}) : null,
+      stats: {
+        conversations: conversations.length,
+        attachments: Object.keys(cp.fetchedFiles || {}).length,
+        skipped_404: (cp.skipped || []).length,
+        failed: (cp.failed || []).length,
+      },
+      errors: cp.failed || [],
+      conversations,
+      ...(Object.keys(attachmentsMap).length > 0 ? { attachments: attachmentsMap } : {}),
+    };
+  }
+
+  // --- Run manifest (lean handoff schema v1) ---
+  function buildRunManifest(cp, config, folderName, filesList, partial) {
+    return {
+      manifest_version: MANIFEST_VERSION,
+      run_id: cp.runId,
+      generated_at: new Date().toISOString(),
+      folder: folderName,
+      tag: deriveTag(config, cp.sourceMeta),
+      source: {
+        kind: config.source.kind,
+        ref: cp.sourceMeta?.ref || (config.source.kind === 'byids' ? `ids-${(config.source.ids || []).length}` : null),
+        exported_at: cp.sourceMeta?.exportedAt || null,
+        unified: cp.sourceMeta?.unified === true,
+      },
+      fetch: {
+        conversations: !!config.fetch.conversations,
+        attachments: !!config.fetch.attachments,
+      },
+      output: {
+        kind: config.output.kind,
+        format: config.output.format || 'json',
+      },
+      stats: {
+        convs: (config.source.kind === 'file' ? Object.keys(cp.sourceConvs || {}).length : Object.keys(cp.fetchedConvs || {}).length),
+        attachments: Object.keys(cp.fetchedFiles || {}).length,
+        skipped_404: (cp.skipped || []).length,
+        failed: (cp.failed || []).length,
+        ...(partial ? { partial: true } : {}),
+      },
+      files: filesList,
+      attachments_index_ref: filesList.includes('attachments-index.json') ? 'attachments-index.json' : null,
+    };
+  }
+
+  // --- Write run folder ---
+  async function writeOutput(cp, config, { partial }) {
+    const folder = runFolderName(config, cp.sourceMeta, partial);
+    const fmt = (config.output.format || 'json').toLowerCase();
+    const hasAtt = Object.keys(cp.fetchedFiles || {}).length > 0;
+    const filesList = [];
+
+    const auth = { accountId: cp.account };
+    const doc = buildConversationsDoc(cp, config, auth);
+    if (partial) doc.stats.partial = true;
+
+    if (config.output.kind === 'json') {
+      // Single-document output. Attachments inline when format=json; otherwise sidecar attachments.json.
+      if (fmt === 'json') {
+        triggerJsonDownload(doc, `${folder}/conversations.json`);
+        filesList.push('conversations.json');
+      } else {
+        // Converter formats drop the attachments map — emit it as a sidecar.
+        const formats = {
+          markdown: { ext: 'md', mime: 'text/markdown', fn: () => toMarkdown(doc) },
+          jsonl:    { ext: 'jsonl', mime: 'application/x-jsonlines', fn: () => toJSONL(doc) },
+          html:     { ext: 'html', mime: 'text/html', fn: () => toHTML(doc) },
+          csv:      { ext: 'csv', mime: 'text/csv', fn: () => toCSV(doc) },
+          txt:      { ext: 'txt', mime: 'text/plain', fn: () => toPlainText(doc) },
+        };
+        const f = formats[fmt];
+        if (!f) throw new Error(`Unknown format: ${fmt}`);
+        triggerTextDownload(f.fn(), f.mime, `${folder}/conversations.${f.ext}`);
+        filesList.push(`conversations.${f.ext}`);
+        if (hasAtt) {
+          // Legacy-shape map for downstream agents
+          const attMap = doc.attachments || {};
+          triggerJsonDownload({ exported_at: doc.exported_at, attachments: attMap }, `${folder}/attachments.json`);
+          filesList.push('attachments.json');
+        }
+      }
+    } else if (config.output.kind === 'zip') {
+      // Loose conversations.json + attachments-index.json + volumed binaries
+      // Emit conversations.json with the legacy schema but WITHOUT the inline attachments map
+      // (binaries live in the zip volumes; the index points to them).
+      const convsOnly = { ...doc };
+      delete convsOnly.attachments;
+      triggerJsonDownload(convsOnly, `${folder}/conversations.json`);
+      filesList.push('conversations.json');
+
+      if (hasAtt) {
+        if (typeof JSZip === 'undefined') {
+          throw new Error('JSZip not loaded — the extension must include vendor/jszip.min.js in content_scripts');
+        }
+        const index = {
+          source_exported_at: cp.sourceMeta?.exportedAt || null,
+          generated_at: new Date().toISOString(),
+          stats: {
+            plan: (config.source.kind === 'file' ? (cp.fileTargets || []).length : Object.keys(cp.fetchedFiles).length + (cp.skipped || []).length + (cp.failed || []).length),
+            fetched: Object.keys(cp.fetchedFiles).length,
+            skipped_404: (cp.skipped || []).length,
+            failed: (cp.failed || []).length,
+          },
+          volume_target_bytes: VOLUME_TARGET_BYTES,
+          attachments: {},
+          skipped_404: cp.skipped || [],
+          failed: cp.failed || [],
+        };
+
+        // Iterate all files, pack into volumes, track each in index
+        let currentZip = new JSZip();
+        let currentBytes = 0;
+        let currentCount = 0;
+        let volNum = 1;
+        const volumeFileNames = [];
+
+        async function flushVolume() {
+          if (currentCount === 0) return;
+          const volName = `attachments-vol${pad2(volNum)}.zip`;
+          progress(`Packing ${volName} (${currentCount} files, ~${(currentBytes/1024/1024).toFixed(1)} MB)…`, 92 + Math.min(volNum, 5));
+          const blob = await currentZip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 1 } });
+          triggerBlobDownload(blob, `${folder}/${volName}`);
+          volumeFileNames.push(volName);
+          volNum++;
+          currentZip = new JSZip();
+          currentBytes = 0;
+          currentCount = 0;
+        }
+
+        // Deterministic ordering: iterate fileTargets (file source) or flatten fetchedFiles keys (conv source)
+        const ordered = (config.source.kind === 'file' && cp.fileTargets?.length)
+          ? cp.fileTargets.map((t) => ({ key: `${t.convId}:${t.fileIndex}`, convId: t.convId, fileIndex: t.fileIndex, convTitle: t.convTitle }))
+          : Object.keys(cp.fetchedFiles).map((key) => {
+              const [convId, idxStr] = key.split(':');
+              return { key, convId, fileIndex: parseInt(idxStr, 10), convTitle: cp.convMeta?.[convId]?.title || '' };
+            });
+
+        for (const row of ordered) {
+          checkAbort();
+          const got = cp.fetchedFiles[row.key];
+          if (!got || !got.data) continue;
+          const b64 = base64FromDataUrl(got.data);
+          if (!b64) continue;
+          const bytes = approxBytesFromB64(b64);
+          const ext = safeExtFromContentType(got.content_type) || '';
+          const safeName = sanitizeName(got.name) || `attachment-${row.fileIndex}`;
+          const baseFileName = safeName.includes('.') ? safeName : `${safeName}${ext}`;
+          const pathInZip = `attachments/${row.convId}/part${row.fileIndex}-${baseFileName}`;
+          currentZip.file(pathInZip, b64, { base64: true });
+          currentBytes += bytes;
+          currentCount++;
+          const indexKey = got.url || row.key;
+          index.attachments[indexKey] = {
+            path: pathInZip,
+            volume: `vol${pad2(volNum)}`,
+            convId: row.convId,
+            convTitle: row.convTitle || '',
+            name: got.name || null,
+            content_type: got.content_type || null,
+            bytes,
+          };
+          if (currentBytes >= VOLUME_TARGET_BYTES) await flushVolume();
+        }
+        await flushVolume();
+        index.stats.volumes = volumeFileNames;
+        triggerJsonDownload(index, `${folder}/attachments-index.json`);
+        filesList.push('attachments-index.json', ...volumeFileNames);
+      }
+    } else {
+      throw new Error(`Unknown output.kind: ${config.output.kind}`);
+    }
+
+    // Run manifest always last so downstream agents can poll for it
+    const manifest = buildRunManifest(cp, config, folder, ['run-manifest.json', ...filesList], partial);
+    triggerJsonDownload(manifest, `${folder}/run-manifest.json`);
+
+    // Append to run_history (lean summary)
+    await appendRunHistory({
+      runId: cp.runId,
+      completed_at: manifest.generated_at,
+      tag: manifest.tag,
+      source: { kind: config.source.kind },
+      fetch: manifest.fetch,
+      output: manifest.output,
+      stats: manifest.stats,
+      files: manifest.files,
+    });
+  }
+
+  async function appendRunHistory(entry) {
+    try {
+      const r = await chrome.storage.local.get(RUN_HISTORY_KEY);
+      const arr = Array.isArray(r[RUN_HISTORY_KEY]) ? r[RUN_HISTORY_KEY] : [];
+      arr.push(entry);
+      while (arr.length > RUN_HISTORY_MAX) arr.shift();
+      await chrome.storage.local.set({ [RUN_HISTORY_KEY]: arr });
+    } catch (e) { D('appendRunHistory:', e.message); }
+  }
+
+  // --- Partial download (user-invoked while paused/running) ---
   async function runDownloadPartial() {
-    D('========== runDownloadPartial ==========');
     try {
       const cp = await loadCheckpoint();
-      if (!cp || Object.keys(cp.fetched).length === 0) {
-        error('No checkpoint with fetched conversations found.');
+      if (!cp || cp.mode !== 'unified') {
+        error('No unified run checkpoint available to download.');
         return;
       }
-      progress('Building partial export…', 50);
-      const auth = { accountId: cp.account };
-      const exportData = buildExportData(cp, auth);
-      exportData.stats.partial = true;
-      const fmt = cp.options.format || 'json';
-      const { ext } = downloadExport(exportData, fmt);
-      done(`Partial export: ${Object.keys(cp.fetched).length}/${cp.targetIds.length} conversations as ${ext.toUpperCase()}`);
+      progress('Writing partial run folder…', 50);
+      await writeOutput(cp, cp.config, { partial: true });
+      const cv = Object.keys(cp.fetchedConvs || {}).length;
+      const fi = Object.keys(cp.fetchedFiles || {}).length;
+      done(`Partial: ${cv} convs, ${fi} files written (checkpoint preserved)`);
     } catch (e) {
-      D('runDownloadPartial: error', e.message);
       error(e.message);
     }
   }
 
-  async function listProjects() {
-    D('listProjects: fetching sidebar...');
-    const auth = await getAuth();
-    const data = await api(
-      '/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=0&limit=50',
-      auth
-    );
-    const projects = (data.items || []).map((item) => {
-      const g = item.gizmo?.gizmo || {};
-      const display = g.display || {};
-      return {
-        id: g.id,
-        name: display.name || 'Untitled',
-        emoji: display.emoji || '',
-        interactions: g.num_interactions || 0,
-      };
-    });
-    D('listProjects: found', projects.length, 'projects:', projects.map((p) => `${p.id} = ${p.name}`));
-    return projects;
-  }
-
-  async function listProjectConversations(gizmoId, auth) {
-    D('listProjectConversations: gizmoId =', gizmoId);
-
-    try {
-      D('listProjectConversations: trying /gizmos endpoint...');
-      let offset = 0;
-      let total = null;
-      const items = [];
-      while (total === null || offset < total) {
-        checkAbort();
-        const url = `/gizmos/${gizmoId}/conversations?offset=${offset}&limit=${LIMIT}`;
-        const data = await api(url, auth);
-        total = data.total;
-        items.push(...(data.items || data.conversations || []));
-        D('listProjectConversations: page — total:', total, ', accumulated:', items.length);
-        offset += LIMIT;
-        if (offset < total) await sleep(delayMs);
-      }
-      D('listProjectConversations: gizmo endpoint returned', items.length, 'conversations');
-      if (items.length > 0) return items;
-    } catch (e) {
-      if (e.message === 'Cancelled by user') throw e;
-      D('listProjectConversations: gizmo endpoint failed:', e.message);
-    }
-
-    D('listProjectConversations: falling back to sidebar approach...');
-    const sidebarData = await api(
-      `/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=200&limit=50`,
-      auth
-    );
-    const match = (sidebarData.items || []).find((item) => {
-      const id = item.gizmo?.gizmo?.id;
-      return id === gizmoId;
-    });
-    const convs = match?.conversations || [];
-    D('listProjectConversations: sidebar returned', convs.length, 'conversations for', gizmoId);
-    for (const c of convs) {
-      D('  sidebar conv:', c.id, '|', c.title);
-    }
-    return convs;
-  }
-
+  // --- Memories (preserved) ---
   async function runExportMemories(options) {
     D('========== runExportMemories START ==========');
     try {
       progress('Authenticating…', 0);
       const auth = await getAuth();
-
       const didCookie = document.cookie.split(';').map((c) => c.trim()).find((c) => c.startsWith('oai-did='));
       const deviceId = didCookie ? didCookie.split('=')[1] : null;
-      D('runExportMemories: deviceId =', deviceId);
 
       checkAbort();
       progress('Fetching memories…', 20);
@@ -1081,38 +953,21 @@ if (!window.__chatgptExportLoaded) {
           'oai-language': 'en-US',
         },
       });
-
-      D('runExportMemories: status =', res.status);
       if (!res.ok) {
         const body = await res.text();
         D('runExportMemories: error body =', body.slice(0, 500));
         throw new Error(`${res.status} ${res.statusText} — /backend-api/memories`);
       }
-
       const data = await res.json();
-      D('runExportMemories: response keys =', Object.keys(data));
-      D('runExportMemories: raw =', JSON.stringify(data).slice(0, 1000));
 
       let memories = [];
-      if (Array.isArray(data.memories)) {
-        memories = data.memories;
-      } else if (Array.isArray(data.memory_entries)) {
-        memories = data.memory_entries;
-      } else if (data.memory_tool_config?.memory_entries) {
-        memories = data.memory_tool_config.memory_entries;
-      } else {
-        D('runExportMemories: unknown response shape — full data:', JSON.stringify(data));
-      }
+      if (Array.isArray(data.memories)) memories = data.memories;
+      else if (Array.isArray(data.memory_entries)) memories = data.memory_entries;
+      else if (data.memory_tool_config?.memory_entries) memories = data.memory_tool_config.memory_entries;
 
-      D('runExportMemories: extracted', memories.length, 'memories');
       progress(`Found ${memories.length} memories`, 60);
+      if (memories.length === 0) { done('No memories found.'); return; }
 
-      if (memories.length === 0) {
-        done('No memories found.');
-        return;
-      }
-
-      checkAbort();
       const exportData = {
         exported_at: new Date().toISOString(),
         account: auth.accountId || 'unknown',
@@ -1127,31 +982,17 @@ if (!window.__chatgptExportLoaded) {
         markdown: { ext: 'md',   mime: 'text/markdown',     fn: () => memoriesToMarkdown(exportData) },
         txt:      { ext: 'txt',  mime: 'text/plain',        fn: () => memoriesToText(exportData) },
       };
-
       const { ext, mime, fn } = formats[fmt] || formats.json;
       progress(`Generating ${ext.toUpperCase()}…`, 90);
-      const content = fn();
-
-      progress('Downloading…', 99);
-      const blob = new Blob([content], { type: mime });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `chatgpt-memories-${datestamp}.${ext}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-
+      triggerTextDownload(fn(), mime, `chatgpt-memories-${datestamp}.${ext}`);
       done(`Exported ${memories.length} memories as ${ext.toUpperCase()}`);
-      D('========== runExportMemories END ==========');
     } catch (e) {
       D('runExportMemories: FATAL ERROR:', e.message, e.stack);
       error(e.message);
     }
   }
 
-  // Listen for messages from popup
+  // --- Message router ---
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     D('MESSAGE RECEIVED:', msg.action);
 
@@ -1162,22 +1003,25 @@ if (!window.__chatgptExportLoaded) {
 
     if (msg.action === 'get-checkpoint') {
       loadCheckpoint().then((cp) => {
-        if (!cp) {
-          sendResponse({ hasCheckpoint: false });
-          return;
-        }
+        if (!cp) { sendResponse({ hasCheckpoint: false }); return; }
+        const isLegacy = cp.mode !== 'unified';
+        const convs = Object.keys(cp.fetchedConvs || cp.fetched || {}).length;
+        const files = Object.keys(cp.fetchedFiles || {}).length;
+        const total = (cp.convIds?.length || 0) + (cp.fileTargets?.length || 0) || (cp.targetIds?.length || 0);
         sendResponse({
           hasCheckpoint: true,
           checkpoint: {
             runId: cp.runId,
             mode: cp.mode,
+            isLegacy,
             startedAt: cp.startedAt,
             lastUpdate: cp.lastUpdate,
             paused: cp.paused,
-            total: cp.targetIds.length,
-            fetched: Object.keys(cp.fetched).length,
+            total,
+            convs,
+            files,
             failed: (cp.failed || []).length,
-            options: cp.options,
+            config: cp.config || null,
           },
         });
       });
@@ -1185,31 +1029,29 @@ if (!window.__chatgptExportLoaded) {
     }
 
     if (msg.action === 'clear-checkpoint') {
-      clearCheckpoint().then(() => sendResponse({ ok: true }));
+      // Also wipe any staged v3.x source keys (legacy-discard path)
+      Promise.all([
+        clearCheckpoint(),
+        chrome.storage.local.remove([ATTACH_SOURCE_KEY_DEFAULT, ATTACH_META_KEY_DEFAULT]).catch(() => {}),
+      ]).then(() => sendResponse({ ok: true }));
       return true;
     }
 
     if (msg.action === 'download-partial') {
-      if (running) {
-        sendResponse({ ok: false, reason: 'Cannot download while export is running — pause first' });
-        return;
-      }
+      if (running) { sendResponse({ ok: false, reason: 'Cannot download partial while a run is active — pause first' }); return; }
       runDownloadPartial();
       sendResponse({ ok: true });
       return;
     }
 
     if (msg.action === 'abort') {
-      D('Abort requested');
       abortRequested = true;
-      // Also clear the checkpoint on abort — user wants it gone
       clearCheckpoint();
       sendResponse({ ok: true });
       return;
     }
 
     if (msg.action === 'pause') {
-      D('Pause requested');
       pauseRequested = true;
       sendResponse({ ok: true });
       return;
@@ -1218,50 +1060,30 @@ if (!window.__chatgptExportLoaded) {
     if (msg.action === 'list-projects') {
       listProjects()
         .then((projects) => sendResponse({ projects }))
-        .catch((e) => {
-          D('list-projects error:', e.message);
-          sendResponse({ projects: [] });
-        });
+        .catch((e) => { D('list-projects error:', e.message); sendResponse({ projects: [] }); });
       return true;
     }
 
-    if (msg.action === 'export') {
-      if (running) {
-        sendResponse({ ok: false, reason: 'Export already in progress' });
-        return;
-      }
+    if (msg.action === 'run-unified') {
+      if (running) { sendResponse({ ok: false, reason: 'Run already in progress' }); return; }
       running = true;
       abortRequested = false;
       pauseRequested = false;
       delayMs = DELAY_INITIAL;
-      runExport(msg.options);
+      runUnified(msg.config);
       sendResponse({ ok: true });
+      return;
     }
 
     if (msg.action === 'exportMemories') {
-      if (running) {
-        sendResponse({ ok: false, reason: 'Export already in progress' });
-        return;
-      }
+      if (running) { sendResponse({ ok: false, reason: 'Run already in progress' }); return; }
       running = true;
       abortRequested = false;
       pauseRequested = false;
       delayMs = DELAY_INITIAL;
       runExportMemories(msg.options);
       sendResponse({ ok: true });
-    }
-
-    if (msg.action === 'attachments-only') {
-      if (running) {
-        sendResponse({ ok: false, reason: 'Export already in progress' });
-        return;
-      }
-      running = true;
-      abortRequested = false;
-      pauseRequested = false;
-      delayMs = DELAY_INITIAL;
-      runAttachmentsOnly(msg.options);
-      sendResponse({ ok: true });
+      return;
     }
   });
 }
