@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Helper",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "Export ChatGPT conversations and memories — unified engine with Fresh/ByIds/File sources, JSON or auto-split ZIP output, run folder + run-manifest.json handoff contract, and resume-on-pause.",
   "permissions": ["activeTab", "scripting", "storage", "unlimitedStorage"],
   "host_permissions": ["https://chatgpt.com/*"],
