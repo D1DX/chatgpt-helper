@@ -290,7 +290,15 @@ if (!window.__chatgptExportLoaded) {
       while (true) {
         attempt++;
         const fetchUrl = resolvedUrl.startsWith('http') ? resolvedUrl : `https://chatgpt.com${resolvedUrl}`;
-        const res = await fetch(fetchUrl, { credentials: 'include', headers: { Authorization: `Bearer ${auth.token}` } });
+        // Signed URLs on files.oaiusercontent.com carry auth in the query string (?se=&sig=).
+        // Sending Authorization: Bearer on them triggers a CORS preflight that OAI's CDN rejects.
+        // Only attach the Bearer header when the fetch is same-origin to chatgpt.com.
+        const urlObj = (() => { try { return new URL(fetchUrl); } catch { return null; } })();
+        const sameOrigin = urlObj && urlObj.hostname === 'chatgpt.com';
+        const res = await fetch(fetchUrl, {
+          credentials: 'include',
+          headers: sameOrigin ? { Authorization: `Bearer ${auth.token}` } : {},
+        });
         if (res.status === 429) {
           delayMs = Math.min(delayMs * 2, DELAY_MAX);
           const retryAfter = parseInt(res.headers.get('Retry-After')) || Math.ceil(delayMs / 1000);
