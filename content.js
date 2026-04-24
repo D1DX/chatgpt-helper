@@ -273,8 +273,8 @@ if (!window.__chatgptExportLoaded) {
   async function fetchAttachmentDetailed(url, auth) {
     try {
       let resolvedUrl = url;
-      if (url && url.startsWith('file-service://')) {
-        const fileId = url.replace('file-service://', '');
+      if (url && (url.startsWith('file-service://') || url.startsWith('sediment://'))) {
+        const fileId = url.replace(/^[^:]+:\/\//, '');
         try {
           const meta = await api(`/files/download/${fileId}?post_id=&inline=false`, auth);
           if (!meta.download_url) return { ok: false, status: 0, reason: 'no-download-url' };
